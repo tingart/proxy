@@ -1,0 +1,11 @@
+{
+  "name": "orbit-source-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
