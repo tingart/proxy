@@ -673,7 +673,7 @@ function rewriteHTML(
   for (const attr of attrs) {
     const regex =
       new RegExp(
-        `(${attr}\\s*=\\s*[\"'])([^\"']+)([\"'])`,
+        `(${attr}\\s*=\\s*["'])([^"']+)(["'])`,
         "gi"
       );
 
@@ -718,12 +718,26 @@ function rewriteHTML(
   }
 
   /* =====================================================
+     FORCE SAME-TAB NAVIGATION
+  ===================================================== */
+
+  /*
+   * No target="_blank", target="new", target="popup",
+   * etc. survives HTML rewriting.
+   */
+  html =
+    html.replace(
+      /\s+target\s*=\s*["'][^"']*["']/gi,
+      ' target="_self"'
+    );
+
+  /* =====================================================
      SRCSET
   ===================================================== */
 
   html =
     html.replace(
-      /(srcset\s*=\s*[\"'])([^\"']+)([\"'])/gi,
+      /(srcset\s*=\s*["'])([^"']+)(["'])/gi,
       (
         full,
         start,
@@ -889,10 +903,17 @@ function rewriteHTML(
 
   function resolveTargetUrl(value) {
     try {
-      return new URL(
+      const raw =
         typeof value === "string"
           ? value
-          : value.url,
+          : value && value.url;
+
+      if (!raw) {
+        return null;
+      }
+
+      return new URL(
+        raw,
         ORBIT_TARGET
       ).href;
     } catch {
@@ -900,10 +921,15 @@ function rewriteHTML(
     }
   }
 
-  function proxyUrlForTarget(url) {
+  /*
+   * IMPORTANT:
+   * Server-side encode() uses base64url.
+   * Browser-side encoding must therefore also be base64url.
+   */
+  function base64UrlEncode(value) {
     const bytes =
       new TextEncoder()
-        .encode(url);
+        .encode(value);
 
     let binary = "";
 
@@ -917,35 +943,71 @@ function rewriteHTML(
       );
     }
 
-    const encoded =
-      btoa(binary)
-        .replace(/=+$/g, "")
-        .replace(/\\+/g, "-")
-        .replace(/\\//g, "_");
+    return btoa(binary)
+      .replace(/=/g, "")
+      .replace(/\\+/g, "-")
+      .replace(/\\//g, "_");
+  }
 
+  function proxyUrlForTarget(url) {
     return (
       "/proxy/" +
       encodeURIComponent(
         ORBIT_SID
       ) +
       "/" +
-      encoded
+      base64UrlEncode(url)
     );
   }
 
-  function isOrbitUrl(url) {
+  function isHttpTarget(url) {
     try {
+      const parsed =
+        new URL(url);
+
       return (
-        new URL(
-          url,
-          location.href
-        ).origin ===
-        location.origin
+        parsed.protocol === "http:" ||
+        parsed.protocol === "https:"
       );
     } catch {
       return false;
     }
   }
+
+  /*
+   * Navigate the CURRENT tab through Orbit.
+   * This is the main no-new-tab rule.
+   */
+  function navigateInsideOrbit(
+    targetUrl
+  ) {
+    const resolved =
+      resolveTargetUrl(
+        targetUrl
+      );
+
+    if (
+      !resolved ||
+      !isHttpTarget(resolved)
+    ) {
+      return false;
+    }
+
+    const proxy =
+      proxyUrlForTarget(
+        resolved
+      );
+
+    location.assign(
+      proxy
+    );
+
+    return true;
+  }
+
+  /* =====================================================
+     BROWSER CACHE
+  ===================================================== */
 
   async function putCache(
     requestUrl,
@@ -1010,15 +1072,9 @@ function rewriteHTML(
 
   /* =====================================================
      ORBIT SOURCE API
-
-     Orbit itself can use:
-       await window.OrbitSource.read(url)
-       await window.OrbitSource.files()
-       await window.OrbitSource.save(url)
   ===================================================== */
 
   window.OrbitSource = {
-
     sid:
       ORBIT_SID,
 
@@ -1043,7 +1099,7 @@ function rewriteHTML(
         );
 
       /*
-       * First look for the actual
+       * First look for actual
        * target URL.
        */
       let response =
@@ -1052,7 +1108,7 @@ function rewriteHTML(
         );
 
       /*
-       * Then look for its proxy URL.
+       * Then look for proxy URL.
        */
       if (!response) {
         const proxy =
@@ -1067,8 +1123,8 @@ function rewriteHTML(
       }
 
       /*
-       * Resource wasn't cached.
-       * Server becomes the fallback.
+       * Finally fetch through
+       * Orbit proxy.
        */
       if (!response) {
         response =
@@ -1131,7 +1187,6 @@ function rewriteHTML(
   ===================================================== */
 
   window.OrbitExtension = {
-
     set(code) {
       if (
         typeof code !==
@@ -1186,11 +1241,6 @@ function rewriteHTML(
         );
       }
 
-      /*
-       * Every request from the
-       * target page goes through
-       * this session.
-       */
       const proxy =
         proxyUrlForTarget(
           targetUrl
@@ -1247,6 +1297,412 @@ function rewriteHTML(
     OrbitXHR;
 
   /* =====================================================
+     HARD SAME-TAB / NO POPUP POLICY
+  ===================================================== */
+
+  /*
+   * Save native window.open only so
+   * we can safely replace it.
+   */
+  const nativeWindowOpen =
+    window.open.bind(
+      window
+    );
+
+  /*
+   * IMPORTANT:
+   * Any HTTP(S) window.open requested
+   * by the target website becomes
+   * a CURRENT-TAB Orbit navigation.
+   *
+   * No real child window is created.
+   */
+  window.open =
+    function(
+      url,
+      name,
+      features
+    ) {
+      const targetUrl =
+        resolveTargetUrl(
+          url
+        );
+
+      if (
+        targetUrl &&
+        isHttpTarget(
+          targetUrl
+        )
+      ) {
+        navigateInsideOrbit(
+          targetUrl
+        );
+
+        /*
+         * Return the current window
+         * instead of a popup Window.
+         */
+        return window;
+      }
+
+      /*
+       * Empty window.open() is often
+       * used by websites as a popup
+       * placeholder. Do not create one.
+       */
+      if (
+        typeof url === "string" &&
+        !url.trim()
+      ) {
+        return window;
+      }
+
+      /*
+       * Browser-internal/non-HTTP
+       * requests are left alone.
+       */
+      return nativeWindowOpen(
+        url,
+        name,
+        features
+      );
+    };
+
+  /* =====================================================
+     LINK / FORM ENFORCEMENT
+  ===================================================== */
+
+  function rewriteAnchor(
+    anchor
+  ) {
+    if (!anchor) {
+      return;
+    }
+
+    /*
+     * Force same tab.
+     */
+    anchor.setAttribute(
+      "target",
+      "_self"
+    );
+
+    const raw =
+      anchor.getAttribute(
+        "href"
+      );
+
+    if (
+      !raw ||
+      raw.startsWith("#")
+    ) {
+      return;
+    }
+
+    const targetUrl =
+      resolveTargetUrl(
+        raw
+      );
+
+    if (
+      targetUrl &&
+      isHttpTarget(
+        targetUrl
+      )
+    ) {
+      anchor.setAttribute(
+        "href",
+        proxyUrlForTarget(
+          targetUrl
+        )
+      );
+    }
+  }
+
+  function rewriteForm(
+    form
+  ) {
+    if (!form) {
+      return;
+    }
+
+    /*
+     * Never submit a form into
+     * a new browser tab/window.
+     */
+    form.setAttribute(
+      "target",
+      "_self"
+    );
+
+    const raw =
+      form.getAttribute(
+        "action"
+      );
+
+    if (!raw) {
+      return;
+    }
+
+    const targetUrl =
+      resolveTargetUrl(
+        raw
+      );
+
+    if (
+      targetUrl &&
+      isHttpTarget(
+        targetUrl
+      )
+    ) {
+      form.setAttribute(
+        "action",
+        proxyUrlForTarget(
+          targetUrl
+        )
+      );
+    }
+  }
+
+  function rewriteNavigationElements(
+    root
+  ) {
+    try {
+      const scope =
+        root || document;
+
+      scope
+        .querySelectorAll(
+          "a[href], area[href]"
+        )
+        .forEach(
+          rewriteAnchor
+        );
+
+      scope
+        .querySelectorAll(
+          "form"
+        )
+        .forEach(
+          rewriteForm
+        );
+
+      /*
+       * Catch any remaining
+       * target attributes.
+       */
+      scope
+        .querySelectorAll(
+          "[target]"
+        )
+        .forEach(
+          element => {
+            element.setAttribute(
+              "target",
+              "_self"
+            );
+          }
+        );
+    } catch {}
+  }
+
+  /* =====================================================
+     CLICK INTERCEPTION
+  ===================================================== */
+
+  /*
+   * Capture BEFORE target site's
+   * click handler.
+   *
+   * This catches:
+   * - target=_blank
+   * - dynamically created links
+   * - middle-click/modified links
+   * - links whose href is external
+   */
+  document.addEventListener(
+    "click",
+    function(event) {
+      const anchor =
+        event.target &&
+        event.target.closest
+          ? event.target.closest(
+              "a[href], area[href]"
+            )
+          : null;
+
+      if (!anchor) {
+        return;
+      }
+
+      const raw =
+        anchor.getAttribute(
+          "href"
+        );
+
+      if (!raw) {
+        return;
+      }
+
+      const targetUrl =
+        resolveTargetUrl(
+          raw
+        );
+
+      if (
+        !targetUrl ||
+        !isHttpTarget(
+          targetUrl
+        )
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      navigateInsideOrbit(
+        targetUrl
+      );
+    },
+    true
+  );
+
+  /* =====================================================
+     AUXCLICK / MIDDLE CLICK
+  ===================================================== */
+
+  document.addEventListener(
+    "auxclick",
+    function(event) {
+      const anchor =
+        event.target &&
+        event.target.closest
+          ? event.target.closest(
+              "a[href], area[href]"
+            )
+          : null;
+
+      if (!anchor) {
+        return;
+      }
+
+      const targetUrl =
+        resolveTargetUrl(
+          anchor.getAttribute(
+            "href"
+          )
+        );
+
+      if (
+        !targetUrl ||
+        !isHttpTarget(
+          targetUrl
+        )
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      navigateInsideOrbit(
+        targetUrl
+      );
+    },
+    true
+  );
+
+  /* =====================================================
+     FORM SUBMIT
+  ===================================================== */
+
+  document.addEventListener(
+    "submit",
+    function(event) {
+      const form =
+        event.target;
+
+      if (
+        !form ||
+        form.tagName !==
+          "FORM"
+      ) {
+        return;
+      }
+
+      rewriteForm(
+        form
+      );
+    },
+    true
+  );
+
+  /* =====================================================
+     MUTATION OBSERVER
+  ===================================================== */
+
+  /*
+   * YouTube and other SPAs dynamically
+   * replace DOM nodes. Keep forcing
+   * same-tab behavior on new content.
+   */
+  try {
+    const observer =
+      new MutationObserver(
+        mutations => {
+          for (
+            const mutation
+              of mutations
+          ) {
+            for (
+              const node
+                of mutation.addedNodes
+            ) {
+              if (
+                node &&
+                node.nodeType === 1
+              ) {
+                rewriteNavigationElements(
+                  node
+                );
+              }
+            }
+          }
+        }
+      );
+
+    observer.observe(
+      document.documentElement,
+      {
+        childList: true,
+        subtree: true
+      }
+    );
+  } catch {}
+
+  /* =====================================================
+     INITIAL NAVIGATION REWRITE
+  ===================================================== */
+
+  if (
+    document.readyState ===
+    "loading"
+  ) {
+    document.addEventListener(
+      "DOMContentLoaded",
+      () => {
+        rewriteNavigationElements();
+      },
+      {
+        once: true
+      }
+    );
+  } else {
+    rewriteNavigationElements();
+  }
+
+  /* =====================================================
      AUTO EXTENSION
   ===================================================== */
 
@@ -1289,7 +1745,9 @@ function rewriteHTML(
     document.addEventListener(
       "DOMContentLoaded",
       runExtension,
-      { once: true }
+      {
+        once: true
+      }
     );
   } else {
     runExtension();
@@ -1317,7 +1775,10 @@ function rewriteHTML(
           );
 
         setTimeout(
-          runExtension,
+          () => {
+            rewriteNavigationElements();
+            runExtension();
+          },
           0
         );
 
@@ -1329,7 +1790,10 @@ function rewriteHTML(
     "popstate",
     () => {
       setTimeout(
-        runExtension,
+        () => {
+          rewriteNavigationElements();
+          runExtension();
+        },
         0
       );
     }
@@ -1346,11 +1810,13 @@ function rewriteHTML(
       html.replace(
         /<head[^>]*>/i,
         match =>
-          match + bridge
+          match +
+          bridge
       );
   } else {
     html =
-      bridge + html;
+      bridge +
+      html;
   }
 
   /* =====================================================
@@ -1374,11 +1840,13 @@ function rewriteHTML(
         html.replace(
           /<head[^>]*>/i,
           match =>
-            match + script
+            match +
+            script
         );
     } else {
       html =
-        script + html;
+        script +
+        html;
     }
   }
 
@@ -1415,7 +1883,9 @@ async function handleProxy(
   }
 
   const navigation =
-    isNavigationRequest(req);
+    isNavigationRequest(
+      req
+    );
 
   if (navigation) {
     const gate =
@@ -1496,7 +1966,8 @@ async function handleProxy(
     if (navigation) {
       chargeNavigation(
         session,
-        Date.now() - started
+        Date.now() -
+        started
       );
     }
 
@@ -1529,6 +2000,12 @@ async function handleProxy(
           next &&
           isHttpUrl(next)
         ) {
+          /*
+           * CRITICAL:
+           * Never expose upstream Location.
+           * Always redirect back through
+           * the same Orbit session.
+           */
           res.setHeader(
             "Location",
             proxyUrl(
@@ -1975,9 +2452,8 @@ app.all(
     }
 
     /*
-     * /results is kept for compatibility,
-     * but the origin comes from the current
-     * session. No website is hardcoded.
+     * /results is retained for compatibility.
+     * Origin comes from current session.
      */
     const queryIndex =
       req.originalUrl.indexOf(
@@ -2588,6 +3064,9 @@ app.get(
         "browser resource cache",
         "browser extension storage",
         "dynamic redirects",
+        "same-tab navigation",
+        "popup blocking",
+        "target=_blank blocking",
         "streaming resources",
         "raw source",
         "results compatibility",
