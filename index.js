@@ -30,7 +30,6 @@ const injections = new Map();
  *   injection,
  *   budgetDay,
  *   usedMs,
- *   lastNavigationAt
  * }
  */
 
@@ -39,7 +38,6 @@ const injections = new Map();
 ========================================================= */
 
 const DAILY_LIMIT_MS = 10 * 60 * 1000;
-const NAVIGATION_COOLDOWN_MS = 4000;
 
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const INJECTION_TTL_MS = 60 * 60 * 1000;
@@ -160,9 +158,7 @@ function createSession(target, injection = null) {
         : null,
 
     budgetDay: Date.now(),
-    usedMs: 0,
-
-    lastNavigationAt: 0
+    usedMs: 0
   });
 
   return sid;
@@ -204,7 +200,8 @@ function resetBudgetIfNeeded(session) {
 
   if (
     !session.budgetDay ||
-    now - session.budgetDay >= 24 * 60 * 60 * 1000
+    now - session.budgetDay >=
+      24 * 60 * 60 * 1000
   ) {
     session.budgetDay = now;
     session.usedMs = 0;
@@ -247,26 +244,12 @@ function isNavigationRequest(req) {
 function navigationAllowed(session) {
   resetBudgetIfNeeded(session);
 
-  if (remainingBudget(session) <= 0) {
-    return {
-      ok: false,
-      reason: "daily-limit"
-    };
-  }
-
-  const now = Date.now();
-
   if (
-    session.lastNavigationAt &&
-    now - session.lastNavigationAt <
-      NAVIGATION_COOLDOWN_MS
+    remainingBudget(session) <= 0
   ) {
     return {
       ok: false,
-      reason: "cooldown",
-      retryAfter:
-        NAVIGATION_COOLDOWN_MS -
-        (now - session.lastNavigationAt)
+      reason: "daily-limit"
     };
   }
 
@@ -282,9 +265,6 @@ function chargeNavigation(session, elapsed) {
     0,
     elapsed
   );
-
-  session.lastNavigationAt =
-    Date.now();
 }
 
 /* =========================================================
@@ -330,8 +310,7 @@ function cookieHeader(session, targetUrl) {
 }
 
 /*
- * We intentionally keep the cookie jar isolated by target origin.
- * Target cookies are never sent to another session.
+ * Target cookies stay isolated by origin.
  */
 function saveCookies(
   response,
@@ -396,16 +375,11 @@ function saveCookies(
       continue;
     }
 
-    /*
-     * Basic deletion handling.
-     */
     const lower =
       String(raw).toLowerCase();
 
     if (
-      lower.includes(
-        "max-age=0"
-      ) ||
+      lower.includes("max-age=0") ||
       lower.includes(
         "expires=thu, 01 jan 1970"
       )
@@ -442,10 +416,6 @@ function buildTargetHeaders(
       "en-US,en;q=0.9"
   };
 
-  /*
-   * Forward useful request headers,
-   * but do not forward hop-by-hop headers.
-   */
   const allowed = [
     "content-type",
     "content-length",
@@ -507,11 +477,6 @@ async function fetchTarget(
   const options = {
     method: req.method,
     headers,
-
-    /*
-     * Manual redirect is required so we can
-     * rewrite Location back into Orbit proxy URLs.
-     */
     redirect: "manual"
   };
 
@@ -543,17 +508,8 @@ const HOP_BY_HOP_HEADERS = new Set([
   "trailer",
   "transfer-encoding",
   "upgrade",
-
-  /*
-   * These can become invalid after fetch/decompression
-   * or HTML rewriting.
-   */
   "content-length",
   "content-encoding",
-
-  /*
-   * Never expose target cookies.
-   */
   "set-cookie"
 ]);
 
@@ -610,30 +566,19 @@ async function streamResponse(
           break;
         }
 
-        if (
-          !res.write(
+        if (value) {
+          res.write(
             Buffer.from(value)
-          )
-        ) {
-          await new Promise(
-            resolve =>
-              res.once(
-                "drain",
-                resolve
-              )
           );
         }
       }
-
-      res.end();
-      return;
-    } catch (error) {
+    } finally {
       try {
-        res.destroy(error);
+        reader.releaseLock();
       } catch {}
-
-      return;
     }
+
+    return res.end();
   }
 
   const buffer =
@@ -641,376 +586,161 @@ async function streamResponse(
       await response.arrayBuffer()
     );
 
-  res.send(buffer);
+  return res.end(buffer);
 }
 
 /* =========================================================
-   HTML URL REWRITER
+   BROWSER BRIDGE
 ========================================================= */
 
-function rewriteHTML(
-  html,
-  target,
-  sid
+function buildBridge(
+  sid,
+  targetUrl
 ) {
-  /*
-   * Normal URL attributes.
-   */
-  const attrs = [
-    "href",
-    "src",
-    "action",
-    "poster",
+  const sidJson =
+    JSON.stringify(String(sid));
 
-    "data-src",
-    "data-href",
-    "data-url",
-    "data-action",
+  const targetJson =
+    JSON.stringify(String(targetUrl));
 
-    "formaction"
-  ];
-
-  for (const attr of attrs) {
-    const regex =
-      new RegExp(
-        `(${attr}\\s*=\\s*["'])([^"']+)(["'])`,
-        "gi"
-      );
-
-    html =
-      html.replace(
-        regex,
-        (
-          full,
-          start,
-          value,
-          end
-        ) => {
-          if (
-            shouldSkipUrl(value)
-          ) {
-            return full;
-          }
-
-          const url =
-            absolute(
-              value,
-              target
-            );
-
-          if (
-            !url ||
-            !isHttpUrl(url)
-          ) {
-            return full;
-          }
-
-          return (
-            start +
-            proxyUrl(
-              url,
-              sid
-            ) +
-            end
-          );
-        }
-      );
-  }
-
-  /* =====================================================
-     FORCE SAME-TAB NAVIGATION
-  ===================================================== */
-
-  /*
-   * No target="_blank", target="new", target="popup",
-   * etc. survives HTML rewriting.
-   */
-  html =
-    html.replace(
-      /\s+target\s*=\s*["'][^"']*["']/gi,
-      ' target="_self"'
-    );
-
-  /* =====================================================
-     SRCSET
-  ===================================================== */
-
-  html =
-    html.replace(
-      /(srcset\s*=\s*["'])([^"']+)(["'])/gi,
-      (
-        full,
-        start,
-        value,
-        end
-      ) => {
-        const result =
-          value
-            .split(",")
-            .map(part => {
-              const pieces =
-                part
-                  .trim()
-                  .split(/\s+/);
-
-              if (!pieces[0]) {
-                return part;
-              }
-
-              const url =
-                absolute(
-                  pieces[0],
-                  target
-                );
-
-              if (
-                url &&
-                isHttpUrl(url)
-              ) {
-                pieces[0] =
-                  proxyUrl(
-                    url,
-                    sid
-                  );
-              }
-
-              return pieces.join(
-                " "
-              );
-            })
-            .join(", ");
-
-        return (
-          start +
-          result +
-          end
-        );
-      }
-    );
-
-  /* =====================================================
-     CSS url()
-  ===================================================== */
-
-  html =
-    html.replace(
-      /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi,
-      (
-        full,
-        quote,
-        value
-      ) => {
-        if (
-          shouldSkipUrl(value)
-        ) {
-          return full;
-        }
-
-        const url =
-          absolute(
-            value,
-            target
-          );
-
-        if (
-          !url ||
-          !isHttpUrl(url)
-        ) {
-          return full;
-        }
-
-        return (
-          `url("${proxyUrl(
-            url,
-            sid
-          )}")`
-        );
-      }
-    );
-
-  /* =====================================================
-     META REFRESH
-  ===================================================== */
-
-  html =
-    html.replace(
-      /(<meta[^>]+http-equiv\s*=\s*["']refresh["'][^>]+content\s*=\s*["'][^"']*\burl=)([^"']+)(["'])/gi,
-      (
-        full,
-        start,
-        value,
-        end
-      ) => {
-        const url =
-          absolute(
-            value.trim(),
-            target
-          );
-
-        if (
-          !url ||
-          !isHttpUrl(url)
-        ) {
-          return full;
-        }
-
-        return (
-          start +
-          proxyUrl(
-            url,
-            sid
-          ) +
-          end
-        );
-      }
-    );
-
-  /* =====================================================
-     ORBIT BROWSER BRIDGE
-  ===================================================== */
-
-  const session =
-    sessions.get(sid);
-
-  const injectionId =
-    session?.injection ||
-    null;
-
-  const bridge = `
+  return `
 <script>
-(() => {
+(function () {
   "use strict";
 
-  const ORBIT_SID =
-    ${JSON.stringify(sid)};
+  if (window.__ORBIT_BRIDGE_LOADED__) {
+    return;
+  }
 
-  const ORBIT_TARGET =
-    ${JSON.stringify(target)};
+  window.__ORBIT_BRIDGE_LOADED__ = true;
 
-  const CACHE_NAME =
-    "orbit-cache-" +
-    ORBIT_SID;
+  const ORBIT_SID = ${sidJson};
+  const ORBIT_TARGET = ${targetJson};
 
-  const EXTENSION_KEY =
-    "orbit-extension-" +
-    ORBIT_SID;
-
-  const nativeFetch =
-    window.fetch.bind(window);
-
-  const NativeXHR =
-    window.XMLHttpRequest;
+  /* =======================================================
+     URL HELPERS
+  ======================================================= */
 
   function resolveTargetUrl(value) {
     try {
-      const raw =
-        typeof value === "string"
-          ? value
-          : value && value.url;
-
-      if (!raw) {
-        return null;
-      }
-
       return new URL(
-        raw,
-        ORBIT_TARGET
+        String(value),
+        window.location.href
       ).href;
     } catch {
       return null;
     }
   }
 
-  /*
-   * IMPORTANT:
-   * Server-side encode() uses base64url.
-   * Browser-side encoding must therefore also be base64url.
-   */
-  function base64UrlEncode(value) {
-    const bytes =
-      new TextEncoder()
-        .encode(value);
-
-    let binary = "";
-
-    for (
-      let i = 0;
-      i < bytes.length;
-      i++
-    ) {
-      binary += String.fromCharCode(
-        bytes[i]
-      );
-    }
-
-    return btoa(binary)
-      .replace(/=/g, "")
-      .replace(/\\+/g, "-")
-      .replace(/\\//g, "_");
-  }
-
-  function proxyUrlForTarget(url) {
-    return (
-      "/proxy/" +
-      encodeURIComponent(
-        ORBIT_SID
-      ) +
-      "/" +
-      base64UrlEncode(url)
-    );
-  }
-
-  function isHttpTarget(url) {
+  function isHttpUrl(value) {
     try {
-      const parsed =
-        new URL(url);
+      const u = new URL(value);
 
       return (
-        parsed.protocol === "http:" ||
-        parsed.protocol === "https:"
+        u.protocol === "http:" ||
+        u.protocol === "https:"
       );
     } catch {
       return false;
     }
   }
 
-  /*
-   * Navigate the CURRENT tab through Orbit.
-   * This is the main no-new-tab rule.
-   */
-  function navigateInsideOrbit(
-    targetUrl
-  ) {
-    const resolved =
-      resolveTargetUrl(
-        targetUrl
-      );
+  function base64UrlEncode(value) {
+    try {
+      const bytes =
+        new TextEncoder().encode(
+          String(value)
+        );
 
-    if (
-      !resolved ||
-      !isHttpTarget(resolved)
-    ) {
+      let binary = "";
+
+      const chunk = 0x8000;
+
+      for (
+        let i = 0;
+        i < bytes.length;
+        i += chunk
+      ) {
+        binary += String.fromCharCode(
+          ...bytes.subarray(
+            i,
+            i + chunk
+          )
+        );
+      }
+
+      return btoa(binary)
+        .replace(/=/g, "")
+        .replace(/\\+/g, "-")
+        .replace(/\\//g, "_");
+    } catch {
+      return "";
+    }
+  }
+
+  function proxyUrlForTarget(value) {
+    const resolved =
+      resolveTargetUrl(value);
+
+    if (!resolved) {
+      return null;
+    }
+
+    if (!isHttpUrl(resolved)) {
+      return null;
+    }
+
+    return (
+      "/proxy/" +
+      encodeURIComponent(ORBIT_SID) +
+      "/" +
+      base64UrlEncode(resolved)
+    );
+  }
+
+  function navigateInsideOrbit(value) {
+    const proxy =
+      proxyUrlForTarget(value);
+
+    if (!proxy) {
       return false;
     }
 
-    const proxy =
-      proxyUrlForTarget(
-        resolved
-      );
-
-    location.assign(
-      proxy
-    );
+    window.location.assign(proxy);
 
     return true;
   }
 
-  /* =====================================================
-     BROWSER CACHE
-  ===================================================== */
+  function isProxyUrl(value) {
+    try {
+      const u =
+        new URL(
+          String(value),
+          window.location.href
+        );
 
-  async function putCache(
-    requestUrl,
+      return (
+        u.origin ===
+          window.location.origin &&
+        u.pathname.startsWith(
+          "/proxy/"
+        )
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /* =======================================================
+     CACHE STORAGE
+  ======================================================= */
+
+  const CACHE_NAME =
+    "orbit-cache-" +
+    ORBIT_SID;
+
+  async function orbitCachePut(
+    request,
     response
   ) {
     try {
@@ -1020,15 +750,18 @@ function rewriteHTML(
         );
 
       await cache.put(
-        requestUrl,
+        request,
         response.clone()
       );
-    } catch {}
+
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  async function cacheFirst(
-    requestUrl,
-    init
+  async function orbitCacheMatch(
+    request
   ) {
     try {
       const cache =
@@ -1036,341 +769,310 @@ function rewriteHTML(
           CACHE_NAME
         );
 
-      const cached =
-        await cache.match(
-          requestUrl
-        );
+      return await cache.match(
+        request
+      );
+    } catch {
+      return undefined;
+    }
+  }
 
-      if (cached) {
-        return cached;
+  /* =======================================================
+     ORBIT SOURCE API
+  ======================================================= */
+
+  window.OrbitSource = {
+    sid: ORBIT_SID,
+
+    target: ORBIT_TARGET,
+
+    proxyUrl:
+      function (url) {
+        return proxyUrlForTarget(
+          url
+        );
+      },
+
+    navigate:
+      function (url) {
+        return navigateInsideOrbit(
+          url
+        );
+      },
+
+    cachePut:
+      orbitCachePut,
+
+    cacheMatch:
+      orbitCacheMatch,
+
+    cacheName:
+      CACHE_NAME
+  };
+
+  /* =======================================================
+     ORBIT EXTENSION API
+  ======================================================= */
+
+  const extensionStore =
+    "orbit-extension-" +
+    ORBIT_SID;
+
+  window.OrbitExtension = {
+    storage: {
+      async get(key) {
+        try {
+          const raw =
+            localStorage.getItem(
+              extensionStore +
+              ":" +
+              key
+            );
+
+          return raw === null
+            ? null
+            : JSON.parse(raw);
+        } catch {
+          return null;
+        }
+      },
+
+      async set(
+        key,
+        value
+      ) {
+        try {
+          localStorage.setItem(
+            extensionStore +
+            ":" +
+            key,
+            JSON.stringify(value)
+          );
+
+          return true;
+        } catch {
+          return false;
+        }
+      },
+
+      async remove(key) {
+        try {
+          localStorage.removeItem(
+            extensionStore +
+            ":" +
+            key
+          );
+
+          return true;
+        } catch {
+          return false;
+        }
+      }
+    },
+
+    open:
+      function (url) {
+        return navigateInsideOrbit(
+          url
+        );
+      },
+
+    proxy:
+      function (url) {
+        return proxyUrlForTarget(
+          url
+        );
+      }
+  };
+
+  /* =======================================================
+     FETCH BRIDGE
+  ======================================================= */
+
+  const nativeFetch =
+    window.fetch.bind(
+      window
+    );
+
+  window.fetch =
+    async function (
+      input,
+      init
+    ) {
+      let originalUrl;
+
+      try {
+        if (
+          typeof input ===
+          "string"
+        ) {
+          originalUrl =
+            resolveTargetUrl(
+              input
+            );
+        } else if (
+          input &&
+          input.url
+        ) {
+          originalUrl =
+            resolveTargetUrl(
+              input.url
+            );
+        }
+      } catch {}
+
+      if (
+        originalUrl &&
+        isHttpUrl(originalUrl) &&
+        !isProxyUrl(originalUrl)
+      ) {
+        const proxied =
+          proxyUrlForTarget(
+            originalUrl
+          );
+
+        if (proxied) {
+          input =
+            typeof input ===
+            "string"
+              ? proxied
+              : new Request(
+                  proxied,
+                  input
+                );
+        }
       }
 
       const response =
         await nativeFetch(
-          requestUrl,
-          init
-        );
-
-      if (
-        response &&
-        response.ok
-      ) {
-        await putCache(
-          requestUrl,
-          response
-        );
-      }
-
-      return response;
-    } catch {
-      return nativeFetch(
-        requestUrl,
-        init
-      );
-    }
-  }
-
-  /* =====================================================
-     ORBIT SOURCE API
-  ===================================================== */
-
-  window.OrbitSource = {
-    sid:
-      ORBIT_SID,
-
-    target:
-      ORBIT_TARGET,
-
-    async read(url) {
-      const targetUrl =
-        resolveTargetUrl(
-          url
-        );
-
-      if (!targetUrl) {
-        throw new Error(
-          "Invalid URL"
-        );
-      }
-
-      const cache =
-        await caches.open(
-          CACHE_NAME
-        );
-
-      /*
-       * First look for actual
-       * target URL.
-       */
-      let response =
-        await cache.match(
-          targetUrl
-        );
-
-      /*
-       * Then look for proxy URL.
-       */
-      if (!response) {
-        const proxy =
-          proxyUrlForTarget(
-            targetUrl
-          );
-
-        response =
-          await cache.match(
-            proxy
-          );
-      }
-
-      /*
-       * Finally fetch through
-       * Orbit proxy.
-       */
-      if (!response) {
-        response =
-          await cacheFirst(
-            proxyUrlForTarget(
-              targetUrl
-            )
-          );
-      }
-
-      return response.text();
-    },
-
-    async get(url) {
-      return this.read(url);
-    },
-
-    async files() {
-      const cache =
-        await caches.open(
-          CACHE_NAME
-        );
-
-      const requests =
-        await cache.keys();
-
-      return requests.map(
-        request =>
-          request.url
-      );
-    },
-
-    async save(url) {
-      const text =
-        await this.read(url);
-
-      const blob =
-        new Blob(
-          [text],
-          {
-            type:
-              "text/plain;charset=utf-8"
-          }
-        );
-
-      return URL.createObjectURL(
-        blob
-      );
-    },
-
-    async clear() {
-      await caches.delete(
-        CACHE_NAME
-      );
-    }
-  };
-
-  /* =====================================================
-     LOCAL EXTENSION STORE
-  ===================================================== */
-
-  window.OrbitExtension = {
-    set(code) {
-      if (
-        typeof code !==
-        "string"
-      ) {
-        throw new TypeError(
-          "Extension code must be a string"
-        );
-      }
-
-      localStorage.setItem(
-        EXTENSION_KEY,
-        code
-      );
-
-      return true;
-    },
-
-    get() {
-      return (
-        localStorage.getItem(
-          EXTENSION_KEY
-        ) || ""
-      );
-    },
-
-    clear() {
-      localStorage.removeItem(
-        EXTENSION_KEY
-      );
-    }
-  };
-
-  /* =====================================================
-     FETCH BRIDGE
-  ===================================================== */
-
-  window.fetch =
-    async function(
-      input,
-      init
-    ) {
-      const targetUrl =
-        resolveTargetUrl(
-          input
-        );
-
-      if (!targetUrl) {
-        return nativeFetch(
           input,
           init
         );
-      }
 
-      const proxy =
-        proxyUrlForTarget(
-          targetUrl
+      try {
+        await orbitCachePut(
+          response.url ||
+            input,
+          response
         );
+      } catch {}
 
-      return cacheFirst(
-        proxy,
-        init
-      );
+      return response;
     };
 
-  /* =====================================================
+  /* =======================================================
      XHR BRIDGE
-  ===================================================== */
+  ======================================================= */
 
-  function OrbitXHR() {
-    const xhr =
-      new NativeXHR();
+  const NativeXHR =
+    window.XMLHttpRequest;
 
+  if (NativeXHR) {
     const nativeOpen =
-      xhr.open.bind(xhr);
+      NativeXHR.prototype.open;
 
-    xhr.open =
-      function(
+    NativeXHR.prototype.open =
+      function (
         method,
         url,
-        ...args
+        async,
+        user,
+        password
       ) {
-        try {
-          const targetUrl =
-            resolveTargetUrl(
-              url
+        let nextUrl =
+          resolveTargetUrl(
+            url
+          );
+
+        if (
+          nextUrl &&
+          isHttpUrl(nextUrl) &&
+          !isProxyUrl(nextUrl)
+        ) {
+          const proxied =
+            proxyUrlForTarget(
+              nextUrl
             );
 
-          if (targetUrl) {
-            url =
-              proxyUrlForTarget(
-                targetUrl
-              );
+          if (proxied) {
+            url = proxied;
           }
-        } catch {}
+        }
 
-        return nativeOpen(
+        return nativeOpen.call(
+          this,
           method,
           url,
-          ...args
+          async !== false,
+          user,
+          password
         );
       };
-
-    return xhr;
   }
 
-  window.XMLHttpRequest =
-    OrbitXHR;
+  /* =======================================================
+     WINDOW.OPEN
+     ======================================================= */
 
-  /* =====================================================
-     HARD SAME-TAB / NO POPUP POLICY
-  ===================================================== */
-
-  /*
-   * Save native window.open only so
-   * we can safely replace it.
-   */
   const nativeWindowOpen =
-    window.open.bind(
-      window
-    );
+    window.open;
 
-  /*
-   * IMPORTANT:
-   * Any HTTP(S) window.open requested
-   * by the target website becomes
-   * a CURRENT-TAB Orbit navigation.
-   *
-   * No real child window is created.
-   */
   window.open =
-    function(
+    function (
       url,
-      name,
+      target,
       features
     ) {
-      const targetUrl =
+      const resolved =
         resolveTargetUrl(
           url
         );
 
       if (
-        targetUrl &&
-        isHttpTarget(
-          targetUrl
-        )
+        resolved &&
+        isHttpUrl(resolved)
       ) {
-        navigateInsideOrbit(
-          targetUrl
-        );
+        const proxy =
+          proxyUrlForTarget(
+            resolved
+          );
 
-        /*
-         * Return the current window
-         * instead of a popup Window.
-         */
-        return window;
+        if (proxy) {
+          /*
+           * IMPORTANT:
+           * Never create a new browser tab/window.
+           * Everything goes into the current
+           * Orbit/Render tab.
+           */
+          window.location.assign(
+            proxy
+          );
+
+          return window;
+        }
       }
 
       /*
-       * Empty window.open() is often
-       * used by websites as a popup
-       * placeholder. Do not create one.
+       * Non-http URLs are left alone.
        */
       if (
-        typeof url === "string" &&
-        !url.trim()
+        typeof nativeWindowOpen ===
+        "function"
       ) {
-        return window;
+        return nativeWindowOpen.call(
+          window,
+          url,
+          "_self",
+          features
+        );
       }
 
-      /*
-       * Browser-internal/non-HTTP
-       * requests are left alone.
-       */
-      return nativeWindowOpen(
-        url,
-        name,
-        features
-      );
+      return window;
     };
 
-  /* =====================================================
-     LINK / FORM ENFORCEMENT
-  ===================================================== */
+  /* =======================================================
+     ANCHORS
+  ======================================================= */
 
   function rewriteAnchor(
     anchor
@@ -1380,7 +1082,7 @@ function rewriteHTML(
     }
 
     /*
-     * Force same tab.
+     * Force every target to same tab.
      */
     anchor.setAttribute(
       "target",
@@ -1392,32 +1094,81 @@ function rewriteHTML(
         "href"
       );
 
+    if (!raw) {
+      return;
+    }
+
     if (
-      !raw ||
-      raw.startsWith("#")
+      raw.startsWith("#") ||
+      raw.startsWith(
+        "javascript:"
+      ) ||
+      raw.startsWith(
+        "mailto:"
+      ) ||
+      raw.startsWith(
+        "tel:"
+      )
     ) {
       return;
     }
 
-    const targetUrl =
+    const resolved =
       resolveTargetUrl(
         raw
       );
 
     if (
-      targetUrl &&
-      isHttpTarget(
-        targetUrl
-      )
+      !resolved ||
+      !isHttpUrl(resolved)
     ) {
-      anchor.setAttribute(
-        "href",
+      return;
+    }
+
+    if (
+      !isProxyUrl(resolved)
+    ) {
+      const proxy =
         proxyUrlForTarget(
-          targetUrl
-        )
-      );
+          resolved
+        );
+
+      if (proxy) {
+        anchor.setAttribute(
+          "href",
+          proxy
+        );
+      }
     }
   }
+
+  function rewriteAnchors(
+    root
+  ) {
+    if (
+      !root ||
+      !root.querySelectorAll
+    ) {
+      return;
+    }
+
+    if (
+      root.matches &&
+      root.matches("a")
+    ) {
+      rewriteAnchor(root);
+    }
+
+    root
+      .querySelectorAll("a")
+      .forEach(
+        rewriteAnchor
+      );
+  }
+
+  /* =======================================================
+     FORMS
+  ======================================================= */
 
   function rewriteForm(
     form
@@ -1426,10 +1177,6 @@ function rewriteHTML(
       return;
     }
 
-    /*
-     * Never submit a form into
-     * a new browser tab/window.
-     */
     form.setAttribute(
       "target",
       "_self"
@@ -1444,90 +1191,71 @@ function rewriteHTML(
       return;
     }
 
-    const targetUrl =
+    const resolved =
       resolveTargetUrl(
         raw
       );
 
     if (
-      targetUrl &&
-      isHttpTarget(
-        targetUrl
-      )
+      !resolved ||
+      !isHttpUrl(resolved)
     ) {
-      form.setAttribute(
-        "action",
+      return;
+    }
+
+    if (
+      !isProxyUrl(resolved)
+    ) {
+      const proxy =
         proxyUrlForTarget(
-          targetUrl
-        )
-      );
+          resolved
+        );
+
+      if (proxy) {
+        form.setAttribute(
+          "action",
+          proxy
+        );
+      }
     }
   }
 
-  function rewriteNavigationElements(
+  function rewriteForms(
     root
   ) {
-    try {
-      const scope =
-        root || document;
+    if (
+      !root ||
+      !root.querySelectorAll
+    ) {
+      return;
+    }
 
-      scope
-        .querySelectorAll(
-          "a[href], area[href]"
-        )
-        .forEach(
-          rewriteAnchor
-        );
+    if (
+      root.matches &&
+      root.matches("form")
+    ) {
+      rewriteForm(root);
+    }
 
-      scope
-        .querySelectorAll(
-          "form"
-        )
-        .forEach(
-          rewriteForm
-        );
-
-      /*
-       * Catch any remaining
-       * target attributes.
-       */
-      scope
-        .querySelectorAll(
-          "[target]"
-        )
-        .forEach(
-          element => {
-            element.setAttribute(
-              "target",
-              "_self"
-            );
-          }
-        );
-    } catch {}
+    root
+      .querySelectorAll("form")
+      .forEach(
+        rewriteForm
+      );
   }
 
-  /* =====================================================
+  /* =======================================================
      CLICK INTERCEPTION
-  ===================================================== */
+  ======================================================= */
 
-  /*
-   * Capture BEFORE target site's
-   * click handler.
-   *
-   * This catches:
-   * - target=_blank
-   * - dynamically created links
-   * - middle-click/modified links
-   * - links whose href is external
-   */
   document.addEventListener(
     "click",
-    function(event) {
+    function (event) {
       const anchor =
         event.target &&
         event.target.closest
           ? event.target.closest(
-              "a[href], area[href]"
+              "a"
             )
           : null;
 
@@ -1535,51 +1263,67 @@ function rewriteHTML(
         return;
       }
 
-      const raw =
+      rewriteAnchor(
+        anchor
+      );
+
+      /*
+       * Always same tab.
+       */
+      anchor.setAttribute(
+        "target",
+        "_self"
+      );
+
+      /*
+       * For normal HTTP(S) links,
+       * ensure they remain inside Orbit.
+       */
+      const href =
         anchor.getAttribute(
           "href"
         );
 
-      if (!raw) {
-        return;
-      }
-
-      const targetUrl =
+      const resolved =
         resolveTargetUrl(
-          raw
+          href
         );
 
       if (
-        !targetUrl ||
-        !isHttpTarget(
-          targetUrl
-        )
+        resolved &&
+        isHttpUrl(resolved) &&
+        !isProxyUrl(resolved)
       ) {
-        return;
+        const proxy =
+          proxyUrlForTarget(
+            resolved
+          );
+
+        if (proxy) {
+          event.preventDefault();
+          event.stopPropagation();
+
+          window.location.assign(
+            proxy
+          );
+        }
       }
-
-      event.preventDefault();
-      event.stopPropagation();
-
-      navigateInsideOrbit(
-        targetUrl
-      );
     },
     true
   );
 
-  /* =====================================================
+  /* =======================================================
      AUXCLICK / MIDDLE CLICK
-  ===================================================== */
+  ======================================================= */
 
   document.addEventListener(
     "auxclick",
-    function(event) {
+    function (event) {
       const anchor =
         event.target &&
         event.target.closest
           ? event.target.closest(
-              "a[href], area[href]"
+              "a"
             )
           : null;
 
@@ -1587,83 +1331,123 @@ function rewriteHTML(
         return;
       }
 
-      const targetUrl =
+      const href =
+        anchor.getAttribute(
+          "href"
+        );
+
+      const resolved =
         resolveTargetUrl(
-          anchor.getAttribute(
-            "href"
-          )
+          href
         );
 
       if (
-        !targetUrl ||
-        !isHttpTarget(
-          targetUrl
-        )
+        resolved &&
+        isHttpUrl(resolved)
       ) {
-        return;
+        const proxy =
+          proxyUrlForTarget(
+            resolved
+          );
+
+        if (proxy) {
+          event.preventDefault();
+          event.stopPropagation();
+
+          window.location.assign(
+            proxy
+          );
+        }
       }
-
-      event.preventDefault();
-      event.stopPropagation();
-
-      navigateInsideOrbit(
-        targetUrl
-      );
     },
     true
   );
 
-  /* =====================================================
+  /* =======================================================
      FORM SUBMIT
-  ===================================================== */
+  ======================================================= */
 
   document.addEventListener(
     "submit",
-    function(event) {
+    function (event) {
       const form =
         event.target;
 
-      if (
-        !form ||
-        form.tagName !==
-          "FORM"
-      ) {
+      if (!form) {
         return;
       }
 
-      rewriteForm(
-        form
+      rewriteForm(form);
+
+      form.setAttribute(
+        "target",
+        "_self"
       );
+
+      const action =
+        form.getAttribute(
+          "action"
+        );
+
+      if (!action) {
+        return;
+      }
+
+      const resolved =
+        resolveTargetUrl(
+          action
+        );
+
+      if (
+        resolved &&
+        isHttpUrl(resolved) &&
+        !isProxyUrl(resolved)
+      ) {
+        const proxy =
+          proxyUrlForTarget(
+            resolved
+          );
+
+        if (proxy) {
+          form.setAttribute(
+            "action",
+            proxy
+          );
+        }
+      }
     },
     true
   );
 
-  /* =====================================================
+  /* =======================================================
      MUTATION OBSERVER
-  ===================================================== */
+  ======================================================= */
 
-  /*
-   * YouTube and other SPAs dynamically
-   * replace DOM nodes. Keep forcing
-   * same-tab behavior on new content.
-   */
-  try {
+  function observeDOM() {
+    if (
+      typeof MutationObserver ===
+      "undefined"
+    ) {
+      return;
+    }
+
     const observer =
       new MutationObserver(
-        mutations => {
+        function (mutations) {
           for (
-            const mutation
-              of mutations
+            const mutation of mutations
           ) {
             for (
-              const node
-                of mutation.addedNodes
+              const node of mutation.addedNodes
             ) {
               if (
-                node &&
                 node.nodeType === 1
               ) {
-                rewriteNavigationElements(
+                rewriteAnchors(
+                  node
+                );
+
+                rewriteForms(
                   node
                 );
               }
@@ -1672,195 +1456,490 @@ function rewriteHTML(
         }
       );
 
-    observer.observe(
-      document.documentElement,
-      {
-        childList: true,
-        subtree: true
-      }
-    );
-  } catch {}
-
-  /* =====================================================
-     INITIAL NAVIGATION REWRITE
-  ===================================================== */
-
-  if (
-    document.readyState ===
-    "loading"
-  ) {
-    document.addEventListener(
-      "DOMContentLoaded",
-      () => {
-        rewriteNavigationElements();
-      },
-      {
-        once: true
-      }
-    );
-  } else {
-    rewriteNavigationElements();
-  }
-
-  /* =====================================================
-     AUTO EXTENSION
-  ===================================================== */
-
-  async function runExtension() {
-    const code =
-      localStorage.getItem(
-        EXTENSION_KEY
-      );
-
-    if (!code) {
-      return;
-    }
-
-    try {
-      const fn =
-        new Function(
-          "window",
-          "document",
-          "location",
-          code
-        );
-
-      await fn(
-        window,
-        document,
-        location
-      );
-    } catch (error) {
-      console.error(
-        "[Orbit Extension]",
-        error
+    if (document.documentElement) {
+      observer.observe(
+        document.documentElement,
+        {
+          childList: true,
+          subtree: true
+        }
       );
     }
   }
 
-  if (
-    document.readyState ===
-    "loading"
-  ) {
-    document.addEventListener(
-      "DOMContentLoaded",
-      runExtension,
-      {
-        once: true
-      }
+  /* =======================================================
+     HISTORY
+  ======================================================= */
+
+  const nativePushState =
+    history.pushState.bind(
+      history
     );
-  } else {
-    runExtension();
-  }
 
-  /* =====================================================
-     SPA HISTORY
-  ===================================================== */
+  const nativeReplaceState =
+    history.replaceState.bind(
+      history
+    );
 
-  for (
-    const method of [
-      "pushState",
-      "replaceState"
-    ]
-  ) {
-    const original =
-      history[method];
+  history.pushState =
+    function (
+      state,
+      title,
+      url
+    ) {
+      let next =
+        url == null
+          ? null
+          : resolveTargetUrl(
+              url
+            );
 
-    history[method] =
-      function() {
-        const result =
-          original.apply(
-            this,
-            arguments
+      if (
+        next &&
+        isHttpUrl(next) &&
+        !isProxyUrl(next)
+      ) {
+        const proxy =
+          proxyUrlForTarget(
+            next
           );
 
-        setTimeout(
-          () => {
-            rewriteNavigationElements();
-            runExtension();
-          },
-          0
+        if (proxy) {
+          url = proxy;
+        }
+      }
+
+      return nativePushState(
+        state,
+        title,
+        url
+      );
+    };
+
+  history.replaceState =
+    function (
+      state,
+      title,
+      url
+    ) {
+      let next =
+        url == null
+          ? null
+          : resolveTargetUrl(
+              url
+            );
+
+      if (
+        next &&
+        isHttpUrl(next) &&
+        !isProxyUrl(next)
+      ) {
+        const proxy =
+          proxyUrlForTarget(
+            next
+          );
+
+        if (proxy) {
+          url = proxy;
+        }
+      }
+
+      return nativeReplaceState(
+        state,
+        title,
+        url
+      );
+    };
+
+  /* =======================================================
+     INITIAL DOM
+  ======================================================= */
+
+  function initialize() {
+    rewriteAnchors(
+      document
+    );
+
+    rewriteForms(
+      document
+    );
+
+    observeDOM();
+
+    /*
+     * Re-run shortly after dynamic
+     * application initialization.
+     */
+    setTimeout(
+      function () {
+        rewriteAnchors(
+          document
         );
 
-        return result;
-      };
+        rewriteForms(
+          document
+        );
+      },
+      100
+    );
+
+    setTimeout(
+      function () {
+        rewriteAnchors(
+          document
+        );
+
+        rewriteForms(
+          document
+        );
+      },
+      1000
+    );
   }
 
-  window.addEventListener(
-    "popstate",
-    () => {
-      setTimeout(
-        () => {
-          rewriteNavigationElements();
-          runExtension();
-        },
-        0
-      );
-    }
-  );
+  if (
+    document.readyState ===
+    "loading"
+  ) {
+    document.addEventListener(
+      "DOMContentLoaded",
+      initialize,
+      {
+        once: true
+      }
+    );
+  } else {
+    initialize();
+  }
+
+  /* =======================================================
+     CUSTOM INJECTION AUTO RUN
+  ======================================================= */
+
+  window.__ORBIT_RUN_EXTENSION__ =
+    function (code) {
+      if (
+        typeof code !==
+        "string"
+      ) {
+        return;
+      }
+
+      try {
+        const fn =
+          new Function(
+            "OrbitSource",
+            "OrbitExtension",
+            code
+          );
+
+        return fn(
+          window.OrbitSource,
+          window.OrbitExtension
+        );
+      } catch (error) {
+        console.error(
+          "Orbit extension error:",
+          error
+        );
+      }
+    };
 
 })();
 </script>
 `;
-
-  if (
-    /<head[^>]*>/i.test(html)
-  ) {
-    html =
-      html.replace(
-        /<head[^>]*>/i,
-        match =>
-          match +
-          bridge
-      );
-  } else {
-    html =
-      bridge +
-      html;
-  }
-
-  /* =====================================================
-     SERVER INJECTION COMPATIBILITY
-  ===================================================== */
-
-  if (injectionId) {
-    const script = `
-<script
-  src="/inject/${encodeURIComponent(
-    injectionId
-  )}.js"
-  data-orbit-injection="server">
-</script>
-`;
-
-    if (
-      /<head[^>]*>/i.test(html)
-    ) {
-      html =
-        html.replace(
-          /<head[^>]*>/i,
-          match =>
-            match +
-            script
-        );
-    } else {
-      html =
-        script +
-        html;
-    }
-  }
-
-  return html;
 }
 
 /* =========================================================
-   PROXY ENGINE
+   HTML REWRITE
+========================================================= */
+
+function rewriteHTML(
+  html,
+  targetUrl,
+  sid,
+  injection
+) {
+  let output =
+    String(html);
+
+  /*
+   * Force all target attributes to _self.
+   *
+   * This prevents normal HTML target="_blank",
+   * target="new", target="popup", etc.
+   */
+  output =
+    output.replace(
+      /(\s)target\s*=\s*(["'])[^"']*\2/gi,
+      '$1target="_self"'
+    );
+
+  /*
+   * Rewrite URLs in HTML attributes.
+   */
+  const attributes = [
+    "href",
+    "src",
+    "action",
+    "poster",
+    "data-src",
+    "data-href",
+    "data-url",
+    "formaction"
+  ];
+
+  for (
+    const attribute of attributes
+  ) {
+    const regex =
+      new RegExp(
+        "(" +
+          attribute +
+          "\\s*=\\s*[\"'])" +
+          "([^\"']+)" +
+          "([\"'])",
+        "gi"
+      );
+
+    output =
+      output.replace(
+        regex,
+        function (
+          full,
+          prefix,
+          value,
+          suffix
+        ) {
+          if (
+            shouldSkipUrl(
+              value
+            )
+          ) {
+            return full;
+          }
+
+          const resolved =
+            absolute(
+              value,
+              targetUrl
+            );
+
+          if (
+            !resolved ||
+            !isHttpUrl(resolved)
+          ) {
+            return full;
+          }
+
+          return (
+            prefix +
+            proxyUrl(
+              resolved,
+              sid
+            ) +
+            suffix
+          );
+        }
+      );
+  }
+
+  /*
+   * Rewrite srcset.
+   */
+  output =
+    output.replace(
+      /(srcset\s*=\s*["'])([^"']+)(["'])/gi,
+      function (
+        full,
+        prefix,
+        value,
+        suffix
+      ) {
+        const parts =
+          value.split(",");
+
+        const rewritten =
+          parts.map(
+            function (part) {
+              const trimmed =
+                part.trim();
+
+              if (!trimmed) {
+                return part;
+              }
+
+              const pieces =
+                trimmed.split(
+                  /\s+/
+                );
+
+              const url =
+                pieces.shift();
+
+              if (
+                shouldSkipUrl(
+                  url
+                )
+              ) {
+                return part;
+              }
+
+              const resolved =
+                absolute(
+                  url,
+                  targetUrl
+                );
+
+              if (
+                !resolved ||
+                !isHttpUrl(
+                  resolved
+                )
+              ) {
+                return part;
+              }
+
+              return [
+                proxyUrl(
+                  resolved,
+                  sid
+                ),
+                ...pieces
+              ].join(" ");
+            }
+          );
+
+        return (
+          prefix +
+          rewritten.join(", ") +
+          suffix
+        );
+      }
+    );
+
+  /*
+   * Rewrite CSS url(...).
+   */
+  output =
+    output.replace(
+      /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi,
+      function (
+        full,
+        quote,
+        value
+      ) {
+        if (
+          shouldSkipUrl(
+            value
+          )
+        ) {
+          return full;
+        }
+
+        const resolved =
+          absolute(
+            value,
+            targetUrl
+          );
+
+        if (
+          !resolved ||
+          !isHttpUrl(resolved)
+        ) {
+          return full;
+        }
+
+        return (
+          "url(" +
+          quote +
+          proxyUrl(
+            resolved,
+            sid
+          ) +
+          quote +
+          ")"
+        );
+      }
+    );
+
+  /*
+   * Add bridge before </head>.
+   */
+  const bridge =
+    buildBridge(
+      sid,
+      targetUrl
+    );
+
+  if (
+    /<\/head\s*>/i.test(
+      output
+    )
+  ) {
+    output =
+      output.replace(
+        /<\/head\s*>/i,
+        bridge +
+        "</head>"
+      );
+  } else {
+    output =
+      bridge +
+      output;
+  }
+
+  /*
+   * Add custom injection.
+   */
+  if (
+    typeof injection ===
+      "string" &&
+    injection.trim()
+  ) {
+    const escaped =
+      JSON.stringify(
+        injection
+      );
+
+    const runner =
+      `<script>
+(function(){
+  try {
+    window.__ORBIT_RUN_EXTENSION__(${escaped});
+  } catch(e) {
+    console.error("Orbit injection error:", e);
+  }
+})();
+</script>`;
+
+    if (
+      /<\/body\s*>/i.test(
+        output
+      )
+    ) {
+      output =
+        output.replace(
+          /<\/body\s*>/i,
+          runner +
+          "</body>"
+        );
+    } else {
+      output += runner;
+    }
+  }
+
+  return output;
+}
+
+/* =========================================================
+   HANDLE PROXY
 ========================================================= */
 
 async function handleProxy(
   req,
   res,
-  url,
+  targetUrl,
   sid
 ) {
   const session =
@@ -1870,15 +1949,17 @@ async function handleProxy(
     return res
       .status(404)
       .send(
-        "Proxy session expired"
+        "Missing proxy session"
       );
   }
 
-  if (!isHttpUrl(url)) {
+  if (
+    !isHttpUrl(targetUrl)
+  ) {
     return res
       .status(400)
       .send(
-        "Only HTTP(S) URLs are supported"
+        "Invalid target URL"
       );
   }
 
@@ -1888,57 +1969,18 @@ async function handleProxy(
     );
 
   if (navigation) {
-    const gate =
+    const allowed =
       navigationAllowed(
         session
       );
 
-    if (!gate.ok) {
-      if (
-        gate.reason ===
-        "daily-limit"
-      ) {
-        return res
-          .status(429)
-          .json({
-            error:
-              "Daily proxy time limit reached",
-
-            dailyLimitSeconds:
-              DAILY_LIMIT_MS / 1000,
-
-            usedSeconds:
-              Math.ceil(
-                session.usedMs /
-                1000
-              ),
-
-            remainingSeconds:
-              Math.floor(
-                remainingBudget(
-                  session
-                ) / 1000
-              )
-          });
-      }
-
-      res.setHeader(
-        "Retry-After",
-        Math.ceil(
-          gate.retryAfter /
-          1000
-        )
-      );
-
+    if (!allowed.ok) {
       return res
         .status(429)
-        .json({
-          error:
-            "Navigation cooldown",
-
-          retryAfterMs:
-            gate.retryAfter
-        });
+        .type("text/plain")
+        .send(
+          "Daily navigation limit reached."
+        );
     }
   }
 
@@ -1948,7 +1990,7 @@ async function handleProxy(
   try {
     const response =
       await fetchTarget(
-        url,
+        targetUrl,
         req,
         sid
       );
@@ -1956,30 +1998,28 @@ async function handleProxy(
     saveCookies(
       response,
       session,
-      url
+      targetUrl
     );
 
     /*
-     * Navigation time is counted
-     * after upstream response arrives.
+     * Charge only the actual elapsed
+     * navigation time.
+     *
+     * There is NO navigation cooldown.
      */
     if (navigation) {
       chargeNavigation(
         session,
-        Date.now() -
-        started
+        Date.now() - started
       );
     }
 
-    setSessionCookie(
-      res,
-      sid
-    );
-
-    /* =====================================================
-       REDIRECT
-    ===================================================== */
-
+    /*
+     * Redirect handling.
+     *
+     * Never allow a target redirect to
+     * escape the Orbit proxy.
+     */
     if (
       response.status >= 300 &&
       response.status < 400
@@ -1990,72 +2030,73 @@ async function handleProxy(
         );
 
       if (location) {
-        const next =
+        const absoluteLocation =
           absolute(
             location,
-            url
+            targetUrl
           );
 
         if (
-          next &&
-          isHttpUrl(next)
+          absoluteLocation &&
+          isHttpUrl(
+            absoluteLocation
+          )
         ) {
-          /*
-           * CRITICAL:
-           * Never expose upstream Location.
-           * Always redirect back through
-           * the same Orbit session.
-           */
+          res.status(
+            response.status
+          );
+
+          copyResponseHeaders(
+            response,
+            res
+          );
+
           res.setHeader(
             "Location",
             proxyUrl(
-              next,
+              absoluteLocation,
               sid
             )
           );
+
+          return res.end();
         }
       }
-
-      return res
-        .status(
-          response.status
-        )
-        .end();
     }
 
-    const contentType =
-      response.headers.get(
-        "content-type"
-      ) || "";
+    copyResponseHeaders(
+      response,
+      res
+    );
 
-    /* =====================================================
-       HTML
-    ===================================================== */
+    const contentType =
+      String(
+        response.headers.get(
+          "content-type"
+        ) || ""
+      ).toLowerCase();
 
     if (
-      contentType
-        .toLowerCase()
-        .includes(
-          "text/html"
-        ) ||
-      contentType
-        .toLowerCase()
-        .includes(
-          "application/xhtml"
-        )
+      contentType.includes(
+        "text/html"
+      )
     ) {
-      const data =
+      const buffer =
         Buffer.from(
           await response.arrayBuffer()
         );
 
       const html =
+        buffer.toString(
+          "utf8"
+        );
+
+      const rewritten =
         rewriteHTML(
-          data.toString(
-            "utf8"
-          ),
-          url,
-          sid
+          html,
+          targetUrl,
+          sid,
+          session.injection
         );
 
       res.status(
@@ -2067,57 +2108,28 @@ async function handleProxy(
         "text/html; charset=utf-8"
       );
 
-      /*
-       * Do not allow stale rewritten
-       * HTML to be reused by a shared
-       * intermediary.
-       */
       res.setHeader(
         "Cache-Control",
         "private, no-store"
       );
 
       return res.send(
-        html
+        rewritten
       );
     }
 
-    /* =====================================================
-       EVERYTHING ELSE
-    ===================================================== */
-
     res.status(
       response.status
-    );
-
-    copyResponseHeaders(
-      response,
-      res
     );
 
     return streamResponse(
       response,
       res
     );
-
   } catch (error) {
-    console.error(
-      "Proxy error:",
-      error
-    );
-
-    /*
-     * If the upstream navigation
-     * failed before completion, don't
-     * leave the cooldown stuck.
-     */
-    if (navigation) {
-      session.lastNavigationAt =
-        0;
-    }
-
     return res
       .status(502)
+      .type("text/plain")
       .send(
         "Proxy fetch failed: " +
         error.message
@@ -2126,49 +2138,62 @@ async function handleProxy(
 }
 
 /* =========================================================
-   /OPEN
+   OPEN
 ========================================================= */
 
 app.get(
   "/open",
-  (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     const target =
       req.query.url;
 
-    if (!target) {
-      return res
-        .status(400)
-        .send(
-          "Missing url"
-        );
-    }
-
     if (
+      !target ||
       !isHttpUrl(target)
     ) {
       return res
         .status(400)
         .send(
-          "Invalid HTTP(S) url"
+          "Invalid url"
         );
     }
 
     const sid =
       createSession(
-        target,
-        req.query.inject
+        target
       );
+
+    const session =
+      sessions.get(
+        sid
+      );
+
+    const allowed =
+      navigationAllowed(
+        session
+      );
+
+    if (!allowed.ok) {
+      return res
+        .status(429)
+        .send(
+          "Daily navigation limit reached."
+        );
+    }
 
     setSessionCookie(
       res,
       sid
     );
 
-    return res.redirect(
-      proxyUrl(
-        target,
-        sid
-      )
+    return handleProxy(
+      req,
+      res,
+      target,
+      sid
     );
   }
 );
@@ -2184,12 +2209,9 @@ app.get(
       getSession(req);
 
     if (!found) {
-      return res
-        .status(404)
-        .json({
-          error:
-            "No proxy session"
-        });
+      return res.json({
+        active: false
+      });
     }
 
     const session =
@@ -2200,19 +2222,23 @@ app.get(
     );
 
     return res.json({
+      active: true,
+
       sid:
         found.sid,
 
       target:
         session.target,
 
-      dailyLimitSeconds:
-        DAILY_LIMIT_MS / 1000,
+      created:
+        session.created,
 
-      usedSeconds:
-        Math.ceil(
-          session.usedMs /
-          1000
+      usedMs:
+        session.usedMs,
+
+      remainingMs:
+        remainingBudget(
+          session
         ),
 
       remainingSeconds:
@@ -2220,23 +2246,13 @@ app.get(
           remainingBudget(
             session
           ) / 1000
-        ),
-
-      cooldownMs:
-        Math.max(
-          0,
-          NAVIGATION_COOLDOWN_MS -
-          (
-            Date.now() -
-            session.lastNavigationAt
-          )
         )
     });
   }
 );
 
 /* =========================================================
-   SESSION PROXY
+   PROXY BY SESSION + ENCODED URL
 ========================================================= */
 
 app.all(
@@ -2249,19 +2265,20 @@ app.all(
       req.params.sid;
 
     if (
+      !sid ||
       !sessions.has(sid)
     ) {
       return res
         .status(404)
         .send(
-          "Proxy session expired"
+          "Missing proxy session"
         );
     }
 
-    let url;
+    let target;
 
     try {
-      url =
+      target =
         decode(
           req.params.encoded
         );
@@ -2269,31 +2286,31 @@ app.all(
       return res
         .status(400)
         .send(
-          "Invalid proxy URL"
+          "Invalid encoded URL"
         );
     }
 
     if (
-      !isHttpUrl(url)
+      !isHttpUrl(target)
     ) {
       return res
         .status(400)
         .send(
-          "Invalid proxy URL"
+          "Invalid target URL"
         );
     }
 
     return handleProxy(
       req,
       res,
-      url,
+      target,
       sid
     );
   }
 );
 
 /* =========================================================
-   /PROXY?URL=
+   PROXY BY URL
 ========================================================= */
 
 app.all(
@@ -2302,19 +2319,12 @@ app.all(
     req,
     res
   ) => {
-    const url =
+    const target =
       req.query.url;
 
-    if (!url) {
-      return res
-        .status(400)
-        .send(
-          "Missing url"
-        );
-    }
-
     if (
-      !isHttpUrl(url)
+      !target ||
+      !isHttpUrl(target)
     ) {
       return res
         .status(400)
@@ -2324,43 +2334,44 @@ app.all(
     }
 
     let found =
-      getSession(
-        req,
-        req.query.sid ||
-          null
-      );
+      getSession(req);
+
+    let sid;
 
     if (!found) {
-      const sid =
+      sid =
         createSession(
-          url,
-          req.query.inject
+          target
         );
 
       found = {
         sid,
         session:
-          sessions.get(sid)
+          sessions.get(
+            sid
+          )
       };
+    } else {
+      sid =
+        found.sid;
     }
 
     setSessionCookie(
       res,
-      found.sid
+      sid
     );
 
     return handleProxy(
       req,
       res,
-      url,
-      found.sid
+      target,
+      sid
     );
   }
 );
 
 /* =========================================================
-   /RESULTS
-   RETAINED
+   RESULTS
 ========================================================= */
 
 app.all(
@@ -2369,77 +2380,59 @@ app.all(
     req,
     res
   ) => {
-    let sid =
-      req.query.sid;
+    let found =
+      getSession(req);
 
-    /*
-     * First use explicit sid.
-     */
-    if (
-      !sid ||
-      !sessions.has(sid)
-    ) {
+    let sid;
+
+    if (!found) {
       /*
-       * Then use session cookie.
+       * Compatibility fallback.
+       *
+       * If no session exists, create one
+       * from the supplied url or a neutral
+       * target.
        */
-      const cookieSid =
-        getCookie(
-          req,
-          "orbit_sid"
-        );
+      const requested =
+        req.query.url ||
+        "https://www.google.com/";
 
       if (
-        cookieSid &&
-        sessions.has(cookieSid)
+        !isHttpUrl(
+          requested
+        )
       ) {
-        sid =
-          cookieSid;
-      }
-    }
-
-    /*
-     * Finally try Referer for old
-     * Orbit behaviour.
-     */
-    if (
-      !sid ||
-      !sessions.has(sid)
-    ) {
-      const referer =
-        req.headers.referer ||
-        "";
-
-      const match =
-        referer.match(
-          /\/proxy\/([^/]+)\//
-        );
-
-      if (match) {
-        sid =
-          decodeURIComponent(
-            match[1]
+        return res
+          .status(400)
+          .send(
+            "Missing proxy session"
           );
       }
-    }
 
-    if (
-      !sid ||
-      !sessions.has(sid)
-    ) {
-      return res
-        .status(400)
-        .send(
-          "Missing proxy session"
+      sid =
+        createSession(
+          requested
         );
+
+      found = {
+        sid,
+        session:
+          sessions.get(
+            sid
+          )
+      };
+    } else {
+      sid =
+        found.sid;
     }
 
     const session =
-      sessions.get(sid);
+      found.session;
 
-    let base;
+    let original;
 
     try {
-      base =
+      original =
         new URL(
           session.target
         );
@@ -2447,14 +2440,10 @@ app.all(
       return res
         .status(400)
         .send(
-          "Invalid target"
+          "Invalid session target"
         );
     }
 
-    /*
-     * /results is retained for compatibility.
-     * Origin comes from current session.
-     */
     const queryIndex =
       req.originalUrl.indexOf(
         "?"
@@ -2467,12 +2456,24 @@ app.all(
           )
         : "";
 
+    /*
+     * IMPORTANT:
+     * /results is intentionally retained.
+     *
+     * It maps to the target origin's
+     * /results endpoint.
+     */
     const target =
       new URL(
         "/results" +
         query,
-        base.origin
+        original.origin
       ).href;
+
+    setSessionCookie(
+      res,
+      sid
+    );
 
     return handleProxy(
       req,
@@ -2484,8 +2485,7 @@ app.all(
 );
 
 /* =========================================================
-   /WATCH
-   RETAINED AS DYNAMIC COMPATIBILITY
+   WATCH
 ========================================================= */
 
 app.all(
@@ -2494,53 +2494,12 @@ app.all(
     req,
     res
   ) => {
-    let sid =
-      req.query.sid;
+    let found =
+      getSession(req);
 
-    if (
-      !sid ||
-      !sessions.has(sid)
-    ) {
-      const cookieSid =
-        getCookie(
-          req,
-          "orbit_sid"
-        );
+    let sid;
 
-      if (
-        cookieSid &&
-        sessions.has(cookieSid)
-      ) {
-        sid =
-          cookieSid;
-      }
-    }
-
-    if (
-      !sid ||
-      !sessions.has(sid)
-    ) {
-      const referer =
-        req.headers.referer ||
-        "";
-
-      const match =
-        referer.match(
-          /\/proxy\/([^/]+)\//
-        );
-
-      if (match) {
-        sid =
-          decodeURIComponent(
-            match[1]
-          );
-      }
-    }
-
-    if (
-      !sid ||
-      !sessions.has(sid)
-    ) {
+    if (!found) {
       return res
         .status(400)
         .send(
@@ -2548,8 +2507,11 @@ app.all(
         );
     }
 
+    sid =
+      found.sid;
+
     const session =
-      sessions.get(sid);
+      found.session;
 
     let base;
 
@@ -2595,7 +2557,7 @@ app.all(
 );
 
 /* =========================================================
-   GENERIC DYNAMIC PATH
+   DYNAMIC PATH
 ========================================================= */
 
 app.all(
@@ -2706,10 +2668,6 @@ app.all(
         );
     }
 
-    /*
-     * Navigation stays inside the
-     * current website origin.
-     */
     let sessionOrigin;
 
     try {
@@ -2781,9 +2739,8 @@ app.all(
       req.query.url;
 
     /*
-     * IMPORTANT:
-     * This is session-bound.
-     * It is not an anonymous open proxy.
+     * Session-bound.
+     * Not an anonymous open proxy.
      */
     if (
       !sid ||
@@ -2940,7 +2897,9 @@ app.get(
       );
 
     const session =
-      sessions.get(sid);
+      sessions.get(
+        sid
+      );
 
     try {
       const response =
@@ -2962,10 +2921,10 @@ app.get(
         );
 
       /*
-       * /source means RAW source.
-       * No rewrite.
-       * No extension.
-       * No bridge.
+       * RAW source:
+       * no HTML rewriting,
+       * no bridge,
+       * no extension.
        */
       res.status(
         response.status
@@ -3051,22 +3010,22 @@ app.get(
       dailyLimitSeconds:
         DAILY_LIMIT_MS / 1000,
 
-      navigationCooldownSeconds:
-        NAVIGATION_COOLDOWN_MS / 1000,
+      navigationCooldown:
+        false,
 
       features: [
         "dynamic URL proxy",
         "isolated sessions",
         "isolated target cookies",
         "HTML rewriting",
+        "same-tab navigation",
+        "popup blocking",
+        "target blank blocking",
         "fetch bridge",
         "XHR bridge",
         "browser resource cache",
         "browser extension storage",
         "dynamic redirects",
-        "same-tab navigation",
-        "popup blocking",
-        "target=_blank blocking",
         "streaming resources",
         "raw source",
         "results compatibility",
