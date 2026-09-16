@@ -20,31 +20,11 @@ app.use(express.raw({
 const sessions = new Map();
 const injections = new Map();
 
-/*
- * Session:
- *
- * {
- *   target,
- *   created,
- *   cookies: Map(origin -> Map(cookieName -> cookieValue)),
- *   injection,
- *   budgetDay,
- *   usedMs,
- * }
- */
-
 /* =========================================================
    LIMITS
 ========================================================= */
 
 const DAILY_LIMIT_MS = 10 * 60 * 1000;
-
-/*
- * IMPORTANT:
- * Navigation cooldown has intentionally been removed.
- *
- * There is NO 4-second navigation cooldown.
- */
 
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const INJECTION_TTL_MS = 60 * 60 * 1000;
@@ -111,11 +91,10 @@ function proxyUrl(url, sid) {
 }
 
 function shouldSkipUrl(value) {
-  const v = String(
-    value || ""
-  )
-    .trim()
-    .toLowerCase();
+  const v =
+    String(value || "")
+      .trim()
+      .toLowerCase();
 
   return (
     !v ||
@@ -155,16 +134,11 @@ function getCookie(req, name) {
     );
 
   return match
-    ? decodeURIComponent(
-        match[1]
-      )
+    ? decodeURIComponent(match[1])
     : null;
 }
 
-function setSessionCookie(
-  res,
-  sid
-) {
+function setSessionCookie(res, sid) {
   res.setHeader(
     "Set-Cookie",
     `orbit_sid=${encodeURIComponent(
@@ -177,8 +151,7 @@ function createSession(
   target,
   injection = null
 ) {
-  const sid =
-    makeId();
+  const sid = makeId();
 
   sessions.set(
     sid,
@@ -188,6 +161,23 @@ function createSession(
       created:
         Date.now(),
 
+      lastActivity:
+        Date.now(),
+
+      /*
+       * Real cookie jar for the complete
+       * proxied session.
+       *
+       * Cookies are matched by:
+       *   domain
+       *   path
+       *   secure
+       *
+       * instead of only target origin.
+       *
+       * This is important for authentication
+       * systems that move between subdomains.
+       */
       cookies:
         new Map(),
 
@@ -219,7 +209,6 @@ function getSession(
   ) {
     return {
       sid,
-
       session:
         sessions.get(sid)
     };
@@ -233,12 +222,11 @@ function getSession(
 
   if (
     cookieSid &&
-    sessions.has(
-      cookieSid
-    )
+    sessions.has(cookieSid)
   ) {
     return {
-      sid: cookieSid,
+      sid:
+        cookieSid,
 
       session:
         sessions.get(
@@ -335,7 +323,6 @@ function navigationAllowed(
   ) {
     return {
       ok: false,
-
       reason:
         "daily-limit"
     };
@@ -365,60 +352,428 @@ function chargeNavigation(
    COOKIE JAR
 ========================================================= */
 
-function getCookieJar(
-  session,
+function defaultCookiePath(
   targetUrl
 ) {
-  const origin =
-    new URL(
-      targetUrl
-    ).origin;
+  try {
+    const pathname =
+      new URL(
+        targetUrl
+      ).pathname || "/";
 
-  let jar =
-    session.cookies.get(
-      origin
+    if (
+      !pathname.startsWith(
+        "/"
+      )
+    ) {
+      return "/";
+    }
+
+    if (
+      pathname === "/"
+    ) {
+      return "/";
+    }
+
+    const index =
+      pathname.lastIndexOf(
+        "/"
+      );
+
+    if (
+      index <= 0
+    ) {
+      return "/";
+    }
+
+    return (
+      pathname.slice(
+        0,
+        index
+      ) || "/"
+    );
+  } catch {
+    return "/";
+  }
+}
+
+function parseSetCookie(
+  raw,
+  targetUrl
+) {
+  const pieces =
+    String(raw)
+      .split(";")
+      .map(
+        part =>
+          part.trim()
+      );
+
+  if (
+    !pieces[0]
+  ) {
+    return null;
+  }
+
+  const eq =
+    pieces[0].indexOf(
+      "="
     );
 
-  if (!jar) {
-    jar =
-      new Map();
+  if (
+    eq <= 0
+  ) {
+    return null;
+  }
 
-    session.cookies.set(
-      origin,
-      jar
+  const name =
+    pieces[0]
+      .slice(0, eq)
+      .trim();
+
+  const value =
+    pieces[0]
+      .slice(eq + 1)
+      .trim();
+
+  let url;
+
+  try {
+    url =
+      new URL(
+        targetUrl
+      );
+  } catch {
+    return null;
+  }
+
+  let domain =
+    url.hostname.toLowerCase();
+
+  let hostOnly =
+    true;
+
+  let path =
+    defaultCookiePath(
+      targetUrl
+    );
+
+  let expiresAt =
+    null;
+
+  let secure =
+    false;
+
+  for (
+    let i = 1;
+    i < pieces.length;
+    i++
+  ) {
+    const part =
+      pieces[i];
+
+    const separator =
+      part.indexOf(
+        "="
+      );
+
+    const attrName =
+      (
+        separator >= 0
+          ? part.slice(
+              0,
+              separator
+            )
+          : part
+      )
+        .trim()
+        .toLowerCase();
+
+    const attrValue =
+      separator >= 0
+        ? part
+            .slice(
+              separator + 1
+            )
+            .trim()
+        : "";
+
+    if (
+      attrName ===
+        "domain" &&
+      attrValue
+    ) {
+      const clean =
+        attrValue
+          .replace(
+            /^\./,
+            ""
+          )
+          .toLowerCase();
+
+      if (clean) {
+        domain =
+          clean;
+
+        hostOnly =
+          false;
+      }
+    } else if (
+      attrName ===
+        "path" &&
+      attrValue.startsWith(
+        "/"
+      )
+    ) {
+      path =
+        attrValue;
+    } else if (
+      attrName ===
+        "max-age"
+    ) {
+      const seconds =
+        Number(
+          attrValue
+        );
+
+      if (
+        Number.isFinite(
+          seconds
+        )
+      ) {
+        expiresAt =
+          Date.now() +
+          Math.max(
+            0,
+            seconds
+          ) *
+            1000;
+      }
+    } else if (
+      attrName ===
+        "expires" &&
+      attrValue
+    ) {
+      const time =
+        Date.parse(
+          attrValue
+        );
+
+      if (
+        Number.isFinite(
+          time
+        )
+      ) {
+        expiresAt =
+          time;
+      }
+    } else if (
+      attrName ===
+        "secure"
+    ) {
+      secure =
+        true;
+    }
+  }
+
+  return {
+    name,
+    value,
+    domain,
+    hostOnly,
+    path:
+      path || "/",
+    expiresAt,
+    secure,
+    createdAt:
+      Date.now()
+  };
+}
+
+function cookieDomainMatches(
+  cookie,
+  hostname
+) {
+  const host =
+    String(
+      hostname || ""
+    ).toLowerCase();
+
+  const domain =
+    String(
+      cookie.domain || ""
+    ).toLowerCase();
+
+  if (
+    !host ||
+    !domain
+  ) {
+    return false;
+  }
+
+  if (
+    cookie.hostOnly
+  ) {
+    return (
+      host === domain
     );
   }
 
-  return jar;
+  return (
+    host === domain ||
+    host.endsWith(
+      "." + domain
+    )
+  );
+}
+
+function cookiePathMatches(
+  cookiePathValue,
+  requestPath
+) {
+  const pathValue =
+    cookiePathValue ||
+    "/";
+
+  const path =
+    requestPath || "/";
+
+  if (
+    pathValue === "/"
+  ) {
+    return true;
+  }
+
+  if (
+    path === pathValue
+  ) {
+    return true;
+  }
+
+  if (
+    !path.startsWith(
+      pathValue
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    pathValue.endsWith(
+      "/"
+    ) ||
+    path[
+      pathValue.length
+    ] === "/"
+  );
+}
+
+function cookieKey(
+  cookie
+) {
+  return [
+    cookie.name,
+    cookie.domain,
+    cookie.path
+  ].join("\u0000");
 }
 
 function cookieHeader(
   session,
   targetUrl
 ) {
-  const origin =
-    new URL(
-      targetUrl
-    ).origin;
-
-  const jar =
-    session.cookies.get(
-      origin
-    );
-
   if (
-    !jar ||
-    jar.size === 0
+    !session ||
+    !session.cookies
   ) {
     return "";
   }
 
-  return [
-    ...jar.entries()
-  ]
+  let url;
+
+  try {
+    url =
+      new URL(
+        targetUrl
+      );
+  } catch {
+    return "";
+  }
+
+  const now =
+    Date.now();
+
+  const matched =
+    [];
+
+  for (
+    const [
+      key,
+      cookie
+    ] of session.cookies
+  ) {
+    if (!cookie) {
+      session.cookies.delete(
+        key
+      );
+
+      continue;
+    }
+
+    if (
+      cookie.expiresAt !==
+        null &&
+      cookie.expiresAt <=
+        now
+    ) {
+      session.cookies.delete(
+        key
+      );
+
+      continue;
+    }
+
+    if (
+      cookie.secure &&
+      url.protocol !==
+        "https:"
+    ) {
+      continue;
+    }
+
+    if (
+      !cookieDomainMatches(
+        cookie,
+        url.hostname
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !cookiePathMatches(
+        cookie.path,
+        url.pathname
+      )
+    ) {
+      continue;
+    }
+
+    matched.push(
+      cookie
+    );
+  }
+
+  matched.sort(
+    (a, b) =>
+      b.path.length -
+      a.path.length
+  );
+
+  return matched
     .map(
-      ([name, value]) =>
-        `${name}=${value}`
+      cookie =>
+        `${cookie.name}=${cookie.value}`
     )
     .join("; ");
 }
@@ -436,12 +791,15 @@ function saveCookies(
     [];
 
   if (
-    typeof response.headers
+    typeof response
+      .headers
       .getSetCookie ===
     "function"
   ) {
     setCookies =
-      response.headers.getSetCookie();
+      response
+        .headers
+        .getSetCookie();
   } else {
     const single =
       response.headers.get(
@@ -449,9 +807,8 @@ function saveCookies(
       );
 
     if (single) {
-      setCookies = [
-        single
-      ];
+      setCookies =
+        [single];
     }
   }
 
@@ -461,64 +818,41 @@ function saveCookies(
     return;
   }
 
-  const jar =
-    getCookieJar(
-      session,
-      targetUrl
-    );
-
   for (
     const raw of setCookies
   ) {
-    const first =
-      String(raw).split(
-        ";"
-      )[0];
+    const cookie =
+      parseSetCookie(
+        raw,
+        targetUrl
+      );
 
-    const index =
-      first.indexOf("=");
-
-    if (index <= 0) {
+    if (!cookie) {
       continue;
     }
 
-    const name =
-      first
-        .slice(
-          0,
-          index
-        )
-        .trim();
-
-    const value =
-      first
-        .slice(
-          index + 1
-        )
-        .trim();
-
-    if (!name) {
-      continue;
-    }
-
-    const lower =
-      String(raw).toLowerCase();
+    const key =
+      cookieKey(
+        cookie
+      );
 
     if (
-      lower.includes(
-        "max-age=0"
-      ) ||
-      lower.includes(
-        "expires=thu, 01 jan 1970"
-      )
+      cookie.expiresAt !==
+        null &&
+      cookie.expiresAt <=
+        Date.now()
     ) {
-      jar.delete(name);
-    } else {
-      jar.set(
-        name,
-        value
+      session.cookies.delete(
+        key
       );
+
+      continue;
     }
+
+    session.cookies.set(
+      key,
+      cookie
+    );
   }
 }
 
@@ -530,6 +864,18 @@ function buildTargetHeaders(
   req,
   targetUrl
 ) {
+  let target;
+
+  try {
+    target =
+      new URL(
+        targetUrl
+      );
+  } catch {
+    target =
+      null;
+  }
+
   const headers = {
     "user-agent":
       req.headers[
@@ -548,7 +894,14 @@ function buildTargetHeaders(
       "en-US,en;q=0.9"
   };
 
-  const allowed = [
+  /*
+   * Forward the browser's real
+   * device/client-hint information.
+   *
+   * Nothing here invents a
+   * desktop/mobile resolution.
+   */
+  const passthrough = [
     "content-type",
     "content-length",
     "range",
@@ -559,21 +912,137 @@ function buildTargetHeaders(
     "cache-control",
     "pragma",
 
-    "origin",
-    "referer",
+    "accept-encoding",
 
-    "accept-encoding"
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "sec-ch-ua-platform-version",
+    "sec-ch-ua-model",
+    "sec-ch-ua-full-version",
+    "sec-ch-ua-full-version-list",
+
+    "sec-ch-viewport-width",
+    "sec-ch-viewport-height",
+
+    "dpr",
+    "viewport-width",
+    "device-memory",
+
+    "save-data",
+    "downlink",
+    "ect",
+    "rtt",
+
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-user"
   ];
 
   for (
-    const name of allowed
+    const name of
+      passthrough
   ) {
     if (
-      req.headers[name]
+      req.headers[name] !==
+      undefined
     ) {
       headers[name] =
         req.headers[name];
     }
+  }
+
+  /*
+   * The browser's Origin normally
+   * contains the Render origin.
+   *
+   * For upstream authentication/CORS
+   * systems, use the current target
+   * origin instead of leaking the
+   * proxy origin.
+   */
+  if (
+    req.headers.origin &&
+    target
+  ) {
+    headers.origin =
+      target.origin;
+  }
+
+  /*
+   * Translate a proxied Referer
+   * back to the upstream URL.
+   */
+  if (
+    req.headers.referer
+  ) {
+    const rawReferer =
+      String(
+        req.headers.referer
+      );
+
+    let upstreamReferer =
+      null;
+
+    const marker =
+      "/proxy/";
+
+    const markerIndex =
+      rawReferer.indexOf(
+        marker
+      );
+
+    if (
+      markerIndex >= 0
+    ) {
+      const rest =
+        rawReferer.slice(
+          markerIndex +
+            marker.length
+        );
+
+      const slash =
+        rest.indexOf(
+          "/"
+        );
+
+      if (
+        slash > 0
+      ) {
+        const encoded =
+          rest
+            .slice(
+              slash + 1
+            )
+            .split(
+              /[?#]/
+            )[0];
+
+        try {
+          const decoded =
+            decode(
+              encoded
+            );
+
+          if (
+            isHttpUrl(
+              decoded
+            )
+          ) {
+            upstreamReferer =
+              decoded;
+          }
+        } catch {}
+      }
+    }
+
+    headers.referer =
+      upstreamReferer ||
+      (
+        target
+          ? target.href
+          : rawReferer
+      );
   }
 
   return headers;
@@ -589,7 +1058,9 @@ async function fetchTarget(
   sid
 ) {
   const session =
-    sessions.get(sid);
+    sessions.get(
+      sid
+    );
 
   const headers =
     buildTargetHeaders(
@@ -616,18 +1087,15 @@ async function fetchTarget(
 
     headers,
 
-    /*
-     * Manual redirect is required so
-     * upstream Location headers can be
-     * converted to Render-relative URLs.
-     */
     redirect:
       "manual"
   };
 
   if (
-    req.method !== "GET" &&
-    req.method !== "HEAD" &&
+    req.method !==
+      "GET" &&
+    req.method !==
+      "HEAD" &&
     req.body &&
     req.body.length
   ) {
@@ -657,24 +1125,29 @@ const HOP_BY_HOP_HEADERS =
     "upgrade",
 
     /*
-     * These can become invalid after
-     * fetch/decompression or HTML rewriting.
+     * Prevent upstream origin
+     * security context from blocking
+     * the Render iframe.
      */
+    "x-frame-options",
+
+    "cross-origin-resource-policy",
+    "cross-origin-embedder-policy",
+    "cross-origin-opener-policy",
+    "origin-agent-cluster",
+
+    /*
+     * CSP is handled separately.
+     */
+
     "content-length",
     "content-encoding",
 
     /*
-     * Never expose target cookies.
+     * Upstream cookies are stored
+     * in the private session jar.
      */
-    "set-cookie",
-
-    /*
-     * IMPORTANT:
-     * The upstream website must not be able
-     * to prevent the proxied page from being
-     * embedded in the Render/Orbit interface.
-     */
-    "x-frame-options"
+    "set-cookie"
   ]);
 
 function sanitizeContentSecurityPolicy(
@@ -684,12 +1157,9 @@ function sanitizeContentSecurityPolicy(
     return value;
   }
 
-  /*
-   * Remove ONLY frame-ancestors.
-   *
-   * Other CSP directives remain intact.
-   */
-  return String(value)
+  return String(
+    value
+  )
     .split(";")
     .map(
       part =>
@@ -707,6 +1177,17 @@ function sanitizeContentSecurityPolicy(
       }
     )
     .join("; ");
+}
+
+function stripHTMLSecurityPolicies(
+  html
+) {
+  return String(
+    html
+  ).replace(
+    /<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy(?:-report-only)?["']?[^>]*>/gi,
+    ""
+  );
 }
 
 function copyResponseHeaders(
@@ -730,13 +1211,26 @@ function copyResponseHeaders(
       continue;
     }
 
-    /*
-     * Remove upstream frame-ancestors
-     * while retaining the rest of CSP.
-     */
     if (
       lower ===
-      "content-security-policy" ||
+      "content-security-policy"
+    ) {
+      const cleaned =
+        sanitizeContentSecurityPolicy(
+          value
+        );
+
+      if (cleaned) {
+        res.setHeader(
+          name,
+          cleaned
+        );
+      }
+
+      continue;
+    }
+
+    if (
       lower ===
       "content-security-policy-report-only"
     ) {
@@ -772,11 +1266,13 @@ async function streamResponse(
 ) {
   if (
     response.body &&
-    typeof response.body.getReader ===
+    typeof response.body
+      .getReader ===
       "function"
   ) {
     const reader =
-      response.body.getReader();
+      response.body
+        .getReader();
 
     try {
       while (true) {
@@ -790,163 +1286,417 @@ async function streamResponse(
           break;
         }
 
-        if (value) {
-          if (
-            !res.write(
-              Buffer.from(
-                value
-              )
+        if (
+          !res.write(
+            Buffer.from(
+              value
             )
-          ) {
-            await new Promise(
-              resolve =>
-                res.once(
-                  "drain",
-                  resolve
-                )
-            );
-          }
+          )
+        ) {
+          await new Promise(
+            resolve =>
+              res.once(
+                "drain",
+                resolve
+              )
+          );
         }
       }
 
       res.end();
-
       return;
     } catch (error) {
       try {
-        reader.cancel();
+        res.destroy(
+          error
+        );
       } catch {}
 
-      if (
-        !res.headersSent
-      ) {
-        res
-          .status(502)
-          .send(
-            "Proxy stream failed: " +
-              error.message
-          );
-      }
+      return;
     }
-
-    return;
   }
 
-  const data =
+  const buffer =
     Buffer.from(
       await response.arrayBuffer()
     );
 
-  res.end(
-    data
+  res.send(
+    buffer
   );
 }
 
 /* =========================================================
-   BROWSER BRIDGE
+   HTML URL REWRITER
 ========================================================= */
 
-function buildBridge(
-  sid,
-  targetUrl
+function rewriteHTML(
+  html,
+  target,
+  sid
 ) {
-  const sidJson =
-    JSON.stringify(
-      String(sid)
+  /*
+   * Force every normal HTML
+   * navigation into same tab.
+   */
+
+  html =
+    html.replace(
+      /\s+target\s*=\s*(["'])[^"']*\1/gi,
+      ' target="_self"'
     );
 
-  const targetJson =
-    JSON.stringify(
-      String(targetUrl)
+  html =
+    html.replace(
+      /\s+target\s*=\s*[^\s>]+/gi,
+      ' target="_self"'
     );
 
-  return `
-<script>
-(function () {
-  "use strict";
+  const attrs = [
+    "href",
+    "src",
+    "action",
+    "poster",
 
-  if (
-    window.__ORBIT_BRIDGE_LOADED__
+    "data-src",
+    "data-href",
+    "data-url",
+    "data-action",
+
+    "formaction"
+  ];
+
+  for (
+    const attr of attrs
   ) {
-    return;
+    const regex =
+      new RegExp(
+        `(${attr}\\s*=\\s*[\"'])([^\"']+)([\"'])`,
+        "gi"
+      );
+
+    html =
+      html.replace(
+        regex,
+        (
+          full,
+          start,
+          value,
+          end
+        ) => {
+          if (
+            shouldSkipUrl(
+              value
+            )
+          ) {
+            return full;
+          }
+
+          const url =
+            absolute(
+              value,
+              target
+            );
+
+          if (
+            !url ||
+            !isHttpUrl(
+              url
+            )
+          ) {
+            return full;
+          }
+
+          return (
+            start +
+            proxyUrl(
+              url,
+              sid
+            ) +
+            end
+          );
+        }
+      );
   }
 
-  window.__ORBIT_BRIDGE_LOADED__ =
-    true;
+  /* =====================================================
+     SRCSET
+  ===================================================== */
+
+  html =
+    html.replace(
+      /(srcset\s*=\s*[\"'])([^\"']+)([\"'])/gi,
+      (
+        full,
+        start,
+        value,
+        end
+      ) => {
+        const result =
+          value
+            .split(",")
+            .map(
+              part => {
+                const pieces =
+                  part
+                    .trim()
+                    .split(
+                      /\s+/
+                    );
+
+                if (
+                  !pieces[0]
+                ) {
+                  return part;
+                }
+
+                const url =
+                  absolute(
+                    pieces[0],
+                    target
+                  );
+
+                if (
+                  url &&
+                  isHttpUrl(
+                    url
+                  )
+                ) {
+                  pieces[0] =
+                    proxyUrl(
+                      url,
+                      sid
+                    );
+                }
+
+                return pieces.join(
+                  " "
+                );
+              }
+            )
+            .join(
+              ", "
+            );
+
+        return (
+          start +
+          result +
+          end
+        );
+      }
+    );
+
+  /* =====================================================
+     CSS URL
+  ===================================================== */
+
+  html =
+    html.replace(
+      /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi,
+      (
+        full,
+        quote,
+        value
+      ) => {
+        if (
+          shouldSkipUrl(
+            value
+          )
+        ) {
+          return full;
+        }
+
+        const url =
+          absolute(
+            value,
+            target
+          );
+
+        if (
+          !url ||
+          !isHttpUrl(
+            url
+          )
+        ) {
+          return full;
+        }
+
+        return (
+          `url("${proxyUrl(
+            url,
+            sid
+          )}")`
+        );
+      }
+    );
+
+  /* =====================================================
+     BASE TAG
+  ===================================================== */
+
+  html =
+    html.replace(
+      /<base\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2([^>]*)>/gi,
+      (
+        full,
+        before,
+        quote,
+        value,
+        after
+      ) => {
+        const url =
+          absolute(
+            value.trim(),
+            target
+          );
+
+        if (
+          !url ||
+          !isHttpUrl(
+            url
+          )
+        ) {
+          return full;
+        }
+
+        return (
+          "<base" +
+          before +
+          'href="' +
+          proxyUrl(
+            url,
+            sid
+          ) +
+          '"' +
+          after +
+          ">"
+        );
+      }
+    );
+
+  /* =====================================================
+     META REFRESH
+  ===================================================== */
+
+  html =
+    html.replace(
+      /(<meta[^>]+http-equiv\s*=\s*["']refresh["'][^>]+content\s*=\s*["'][^"']*\burl=)([^"']+)(["'])/gi,
+      (
+        full,
+        start,
+        value,
+        end
+      ) => {
+        const url =
+          absolute(
+            value.trim(),
+            target
+          );
+
+        if (
+          !url ||
+          !isHttpUrl(
+            url
+          )
+        ) {
+          return full;
+        }
+
+        return (
+          start +
+          proxyUrl(
+            url,
+            sid
+          ) +
+          end
+        );
+      }
+    );
+
+  /* =====================================================
+     ORBIT BROWSER BRIDGE
+  ===================================================== */
+
+  const session =
+    sessions.get(
+      sid
+    );
+
+  const injectionId =
+    session?.injection ||
+    null;
+
+  const bridge = `
+<script>
+(() => {
+  "use strict";
 
   const ORBIT_SID =
-    ${sidJson};
+    ${JSON.stringify(
+      sid
+    )};
 
   const ORBIT_TARGET =
-    ${targetJson};
+    ${JSON.stringify(
+      target
+    )};
 
-  /* =======================================================
-     URL HELPERS
-  ======================================================= */
+  const CACHE_NAME =
+    "orbit-cache-" +
+    ORBIT_SID;
+
+  const EXTENSION_KEY =
+    "orbit-extension-" +
+    ORBIT_SID;
+
+  const nativeFetch =
+    window.fetch.bind(
+      window
+    );
+
+  const NativeXHR =
+    window.XMLHttpRequest;
 
   function resolveTargetUrl(
     value
   ) {
     try {
       return new URL(
-        String(value),
-        window.location.href
+        typeof value ===
+          "string"
+          ? value
+          : value.url,
+        ORBIT_TARGET
       ).href;
     } catch {
       return null;
     }
   }
 
-  function isHttpUrl(
-    value
+  function proxyUrlForTarget(
+    url
   ) {
-    try {
-      const u =
-        new URL(value);
+    const bytes =
+      new TextEncoder()
+        .encode(url);
 
-      return (
-        u.protocol ===
-          "http:" ||
-        u.protocol ===
-          "https:"
-      );
-    } catch {
-      return false;
+    let binary = "";
+
+    for (
+      let i = 0;
+      i < bytes.length;
+      i++
+    ) {
+      binary +=
+        String.fromCharCode(
+          bytes[i]
+        );
     }
-  }
 
-  function base64UrlEncode(
-    value
-  ) {
-    try {
-      const bytes =
-        new TextEncoder()
-          .encode(
-            String(value)
-          );
-
-      let binary = "";
-
-      const chunk =
-        0x8000;
-
-      for (
-        let i = 0;
-        i < bytes.length;
-        i += chunk
-      ) {
-        binary +=
-          String.fromCharCode(
-            ...bytes.subarray(
-              i,
-              i + chunk
-            )
-          );
-      }
-
-      return btoa(binary)
+    const encoded =
+      btoa(binary)
         .replace(
-          /=/g,
+          /=+$/g,
           ""
         )
         .replace(
@@ -957,30 +1707,6 @@ function buildBridge(
           /\\//g,
           "_"
         );
-    } catch {
-      return "";
-    }
-  }
-
-  function proxyUrlForTarget(
-    value
-  ) {
-    const resolved =
-      resolveTargetUrl(
-        value
-      );
-
-    if (!resolved) {
-      return null;
-    }
-
-    if (
-      !isHttpUrl(
-        resolved
-      )
-    ) {
-      return null;
-    }
 
     return (
       "/proxy/" +
@@ -988,66 +1714,28 @@ function buildBridge(
         ORBIT_SID
       ) +
       "/" +
-      base64UrlEncode(
-        resolved
-      )
+      encoded
     );
   }
 
-  function navigateInsideOrbit(
-    value
-  ) {
-    const proxy =
-      proxyUrlForTarget(
-        value
-      );
-
-    if (!proxy) {
-      return false;
-    }
-
-    /*
-     * ALWAYS current Render/Orbit tab.
-     */
-    window.location.assign(
-      proxy
-    );
-
-    return true;
-  }
-
-  function isProxyUrl(
-    value
+  function isOrbitUrl(
+    url
   ) {
     try {
-      const u =
-        new URL(
-          String(value),
-          window.location.href
-        );
-
       return (
-        u.origin ===
-          window.location.origin &&
-        u.pathname.startsWith(
-          "/proxy/"
-        )
+        new URL(
+          url,
+          location.href
+        ).origin ===
+        location.origin
       );
     } catch {
       return false;
     }
   }
 
-  /* =======================================================
-     CACHE STORAGE
-  ======================================================= */
-
-  const CACHE_NAME =
-    "orbit-cache-" +
-    ORBIT_SID;
-
-  async function orbitCachePut(
-    request,
+  async function putCache(
+    requestUrl,
     response
   ) {
     try {
@@ -1057,18 +1745,15 @@ function buildBridge(
         );
 
       await cache.put(
-        request,
+        requestUrl,
         response.clone()
       );
-
-      return true;
-    } catch {
-      return false;
-    }
+    } catch {}
   }
 
-  async function orbitCacheMatch(
-    request
+  async function cacheFirst(
+    requestUrl,
+    init
   ) {
     try {
       const cache =
@@ -1076,334 +1761,319 @@ function buildBridge(
           CACHE_NAME
         );
 
-      return await cache.match(
-        request
-      );
+      const cached =
+        await cache.match(
+          requestUrl
+        );
+
+      if (cached) {
+        return cached;
+      }
+
+      const response =
+        await nativeFetch(
+          requestUrl,
+          init
+        );
+
+      if (
+        response &&
+        response.ok
+      ) {
+        await putCache(
+          requestUrl,
+          response
+        );
+      }
+
+      return response;
     } catch {
-      return undefined;
+      return nativeFetch(
+        requestUrl,
+        init
+      );
     }
   }
 
-  /* =======================================================
+  /* =====================================================
      ORBIT SOURCE API
-  ======================================================= */
+  ===================================================== */
 
   window.OrbitSource = {
+
     sid:
       ORBIT_SID,
 
     target:
       ORBIT_TARGET,
 
-    proxyUrl:
-      function (url) {
-        return proxyUrlForTarget(
-          url
-        );
-      },
-
-    navigate:
-      function (url) {
-        return navigateInsideOrbit(
-          url
-        );
-      },
-
-    cachePut:
-      orbitCachePut,
-
-    cacheMatch:
-      orbitCacheMatch,
-
-    cacheName:
-      CACHE_NAME
-  };
-
-  /* =======================================================
-     ORBIT EXTENSION API
-  ======================================================= */
-
-  const extensionStore =
-    "orbit-extension-" +
-    ORBIT_SID;
-
-  window.OrbitExtension = {
-    storage: {
-      async get(
-        key
-      ) {
-        try {
-          const raw =
-            localStorage.getItem(
-              extensionStore +
-                ":" +
-                key
-            );
-
-          return raw ===
-            null
-            ? null
-            : JSON.parse(
-                raw
-              );
-        } catch {
-          return null;
-        }
-      },
-
-      async set(
-        key,
-        value
-      ) {
-        try {
-          localStorage.setItem(
-            extensionStore +
-              ":" +
-              key,
-            JSON.stringify(
-              value
-            )
-          );
-
-          return true;
-        } catch {
-          return false;
-        }
-      },
-
-      async remove(
-        key
-      ) {
-        try {
-          localStorage.removeItem(
-            extensionStore +
-              ":" +
-              key
-          );
-
-          return true;
-        } catch {
-          return false;
-        }
-      }
-    },
-
-    open:
-      function (url) {
-        return navigateInsideOrbit(
-          url
-        );
-      },
-
-    proxy:
-      function (url) {
-        return proxyUrlForTarget(
-          url
-        );
-      }
-  };
-
-  /* =======================================================
-     FETCH BRIDGE
-  ======================================================= */
-
-  const nativeFetch =
-    window.fetch.bind(
-      window
-    );
-
-  window.fetch =
-    async function (
-      input,
-      init
-    ) {
-      let originalUrl;
-
-      try {
-        if (
-          typeof input ===
-          "string"
-        ) {
-          originalUrl =
-            resolveTargetUrl(
-              input
-            );
-        } else if (
-          input &&
-          input.url
-        ) {
-          originalUrl =
-            resolveTargetUrl(
-              input.url
-            );
-        }
-      } catch {}
-
-      if (
-        originalUrl &&
-        isHttpUrl(
-          originalUrl
-        ) &&
-        !isProxyUrl(
-          originalUrl
-        )
-      ) {
-        const proxied =
-          proxyUrlForTarget(
-            originalUrl
-          );
-
-        if (proxied) {
-          input =
-            typeof input ===
-            "string"
-              ? proxied
-              : new Request(
-                  proxied,
-                  input
-                );
-        }
-      }
-
-      const response =
-        await nativeFetch(
-          input,
-          init
-        );
-
-      try {
-        await orbitCachePut(
-          response.url ||
-            input,
-          response
-        );
-      } catch {}
-
-      return response;
-    };
-
-  /* =======================================================
-     XHR BRIDGE
-  ======================================================= */
-
-  const NativeXHR =
-    window.XMLHttpRequest;
-
-  if (NativeXHR) {
-    const nativeOpen =
-      NativeXHR.prototype.open;
-
-    NativeXHR.prototype.open =
-      function (
-        method,
-        url,
-        async,
-        user,
-        password
-      ) {
-        let nextUrl =
-          resolveTargetUrl(
-            url
-          );
-
-        if (
-          nextUrl &&
-          isHttpUrl(
-            nextUrl
-          ) &&
-          !isProxyUrl(
-            nextUrl
-          )
-        ) {
-          const proxied =
-            proxyUrlForTarget(
-              nextUrl
-            );
-
-          if (proxied) {
-            url =
-              proxied;
-          }
-        }
-
-        return nativeOpen.call(
-          this,
-          method,
-          url,
-          async !== false,
-          user,
-          password
-        );
-      };
-  }
-
-  /* =======================================================
-     WINDOW.OPEN
-  ======================================================= */
-
-  const nativeWindowOpen =
-    window.open;
-
-  window.open =
-    function (
-      url,
-      target,
-      features
-    ) {
-      const resolved =
+    async read(url) {
+      const targetUrl =
         resolveTargetUrl(
           url
         );
 
-      if (
-        resolved &&
-        isHttpUrl(
-          resolved
-        )
-      ) {
-        const proxy =
-          proxyUrlForTarget(
-            resolved
-          );
-
-        if (proxy) {
-          /*
-           * NEVER create a new browser
-           * tab/window.
-           *
-           * Everything stays on Render.
-           */
-          window.location.assign(
-            proxy
-          );
-
-          return window;
-        }
+      if (!targetUrl) {
+        throw new Error(
+          "Invalid URL"
+        );
       }
 
-      /*
-       * Non-http URLs are left alone,
-       * but target is still forced to
-       * the current window.
-       */
-      if (
-        typeof nativeWindowOpen ===
-        "function"
-      ) {
-        return nativeWindowOpen.call(
-          window,
-          url,
-          "_self",
-          features
+      const cache =
+        await caches.open(
+          CACHE_NAME
         );
+
+      let response =
+        await cache.match(
+          targetUrl
+        );
+
+      if (!response) {
+        const proxy =
+          proxyUrlForTarget(
+            targetUrl
+          );
+
+        response =
+          await cache.match(
+            proxy
+          );
+      }
+
+      if (!response) {
+        response =
+          await cacheFirst(
+            proxyUrlForTarget(
+              targetUrl
+            )
+          );
+      }
+
+      return response.text();
+    },
+
+    async get(url) {
+      return this.read(
+        url
+      );
+    },
+
+    async files() {
+      const cache =
+        await caches.open(
+          CACHE_NAME
+        );
+
+      const requests =
+        await cache.keys();
+
+      return requests.map(
+        request =>
+          request.url
+      );
+    },
+
+    async save(url) {
+      const text =
+        await this.read(
+          url
+        );
+
+      const blob =
+        new Blob(
+          [text],
+          {
+            type:
+              "text/plain;charset=utf-8"
+          }
+        );
+
+      return URL.createObjectURL(
+        blob
+      );
+    },
+
+    async clear() {
+      await caches.delete(
+        CACHE_NAME
+      );
+    }
+  };
+
+  /* =====================================================
+     LOCAL EXTENSION STORE
+  ===================================================== */
+
+  window.OrbitExtension = {
+
+    set(code) {
+      if (
+        typeof code !==
+        "string"
+      ) {
+        throw new TypeError(
+          "Extension code must be a string"
+        );
+      }
+
+      localStorage.setItem(
+        EXTENSION_KEY,
+        code
+      );
+
+      return true;
+    },
+
+    get() {
+      return (
+        localStorage.getItem(
+          EXTENSION_KEY
+        ) || ""
+      );
+    },
+
+    clear() {
+      localStorage.removeItem(
+        EXTENSION_KEY
+      );
+    }
+  };
+
+  /* =====================================================
+     FETCH BRIDGE
+  ===================================================== */
+
+  window.fetch =
+    async function(
+      input,
+      init
+    ) {
+      const targetUrl =
+        resolveTargetUrl(
+          input
+        );
+
+      if (!targetUrl) {
+        return nativeFetch(
+          input,
+          init
+        );
+      }
+
+      const proxy =
+        proxyUrlForTarget(
+          targetUrl
+        );
+
+      return cacheFirst(
+        proxy,
+        init
+      );
+    };
+
+  /* =====================================================
+     XHR BRIDGE
+  ===================================================== */
+
+  function OrbitXHR() {
+    const xhr =
+      new NativeXHR();
+
+    const nativeOpen =
+      xhr.open.bind(
+        xhr
+      );
+
+    xhr.open =
+      function(
+        method,
+        url,
+        ...args
+      ) {
+        try {
+          const targetUrl =
+            resolveTargetUrl(
+              url
+            );
+
+          if (targetUrl) {
+            url =
+              proxyUrlForTarget(
+                targetUrl
+              );
+          }
+        } catch {}
+
+        return nativeOpen(
+          method,
+          url,
+          ...args
+        );
+      };
+
+    return xhr;
+  }
+
+  window.XMLHttpRequest =
+    OrbitXHR;
+
+  /* =====================================================
+     STRICT SAME-RENDER NAVIGATION
+  ===================================================== */
+
+  function orbitProxyTarget(
+    value
+  ) {
+    const targetUrl =
+      resolveTargetUrl(
+        value
+      );
+
+    if (!targetUrl) {
+      return null;
+    }
+
+    return proxyUrlForTarget(
+      targetUrl
+    );
+  }
+
+  function orbitNavigate(
+    value
+  ) {
+    const proxy =
+      orbitProxyTarget(
+        value
+      );
+
+    if (!proxy) {
+      return false;
+    }
+
+    window.location.assign(
+      proxy
+    );
+
+    return true;
+  }
+
+  window.open =
+    function(value) {
+      if (
+        orbitNavigate(
+          value
+        )
+      ) {
+        return window;
       }
 
       return window;
     };
 
-  /* =======================================================
+  /* =====================================================
      ANCHORS
-  ======================================================= */
+  ===================================================== */
 
   function rewriteAnchor(
     anchor
@@ -1412,9 +2082,6 @@ function buildBridge(
       return;
     }
 
-    /*
-     * Force every anchor to same tab.
-     */
     anchor.setAttribute(
       "target",
       "_self"
@@ -1429,89 +2096,44 @@ function buildBridge(
       return;
     }
 
+    const trimmed =
+      raw.trim();
+
     if (
-      raw.startsWith(
+      trimmed.startsWith(
         "#"
       ) ||
-      raw.startsWith(
+      trimmed.startsWith(
         "javascript:"
       ) ||
-      raw.startsWith(
+      trimmed.startsWith(
         "mailto:"
       ) ||
-      raw.startsWith(
+      trimmed.startsWith(
         "tel:"
+      ) ||
+      trimmed.startsWith(
+        "data:"
+      ) ||
+      trimmed.startsWith(
+        "blob:"
       )
     ) {
       return;
     }
 
-    const resolved =
-      resolveTargetUrl(
-        raw
+    const proxy =
+      orbitProxyTarget(
+        trimmed
       );
 
-    if (
-      !resolved ||
-      !isHttpUrl(
-        resolved
-      )
-    ) {
-      return;
-    }
-
-    if (
-      !isProxyUrl(
-        resolved
-      )
-    ) {
-      const proxy =
-        proxyUrlForTarget(
-          resolved
-        );
-
-      if (proxy) {
-        anchor.setAttribute(
-          "href",
-          proxy
-        );
-      }
+    if (proxy) {
+      anchor.setAttribute(
+        "href",
+        proxy
+      );
     }
   }
-
-  function rewriteAnchors(
-    root
-  ) {
-    if (
-      !root ||
-      !root.querySelectorAll
-    ) {
-      return;
-    }
-
-    if (
-      root.matches &&
-      root.matches(
-        "a"
-      )
-    ) {
-      rewriteAnchor(
-        root
-      );
-    }
-
-    root
-      .querySelectorAll(
-        "a"
-      )
-      .forEach(
-        rewriteAnchor
-      );
-  }
-
-  /* =======================================================
-     FORMS
-  ======================================================= */
 
   function rewriteForm(
     form
@@ -1528,46 +2150,23 @@ function buildBridge(
     const raw =
       form.getAttribute(
         "action"
-      );
+      ) ||
+      window.location.href;
 
-    if (!raw) {
-      return;
-    }
-
-    const resolved =
-      resolveTargetUrl(
+    const proxy =
+      orbitProxyTarget(
         raw
       );
 
-    if (
-      !resolved ||
-      !isHttpUrl(
-        resolved
-      )
-    ) {
-      return;
-    }
-
-    if (
-      !isProxyUrl(
-        resolved
-      )
-    ) {
-      const proxy =
-        proxyUrlForTarget(
-          resolved
-        );
-
-      if (proxy) {
-        form.setAttribute(
-          "action",
-          proxy
-        );
-      }
+    if (proxy) {
+      form.setAttribute(
+        "action",
+        proxy
+      );
     }
   }
 
-  function rewriteForms(
+  function rewriteNavigationTree(
     root
   ) {
     if (
@@ -1579,14 +2178,29 @@ function buildBridge(
 
     if (
       root.matches &&
-      root.matches(
-        "form"
-      )
+      root.matches("a")
+    ) {
+      rewriteAnchor(
+        root
+      );
+    }
+
+    if (
+      root.matches &&
+      root.matches("form")
     ) {
       rewriteForm(
         root
       );
     }
+
+    root
+      .querySelectorAll(
+        "a"
+      )
+      .forEach(
+        rewriteAnchor
+      );
 
     root
       .querySelectorAll(
@@ -1597,13 +2211,9 @@ function buildBridge(
       );
   }
 
-  /* =======================================================
-     CLICK INTERCEPTION
-  ======================================================= */
-
   document.addEventListener(
     "click",
-    function (event) {
+    function(event) {
       const anchor =
         event.target &&
         event.target.closest
@@ -1620,55 +2230,32 @@ function buildBridge(
         anchor
       );
 
-      anchor.setAttribute(
-        "target",
-        "_self"
-      );
-
       const href =
         anchor.getAttribute(
           "href"
         );
 
-      const resolved =
-        resolveTargetUrl(
+      const proxy =
+        orbitProxyTarget(
           href
         );
 
-      if (
-        resolved &&
-        isHttpUrl(
-          resolved
-        ) &&
-        !isProxyUrl(
-          resolved
-        )
-      ) {
-        const proxy =
-          proxyUrlForTarget(
-            resolved
-          );
+      if (proxy) {
+        event.preventDefault();
 
-        if (proxy) {
-          event.preventDefault();
-          event.stopPropagation();
+        event.stopImmediatePropagation();
 
-          window.location.assign(
-            proxy
-          );
-        }
+        window.location.assign(
+          proxy
+        );
       }
     },
     true
   );
 
-  /* =======================================================
-     AUXCLICK / MIDDLE CLICK
-  ======================================================= */
-
   document.addEventListener(
     "auxclick",
-    function (event) {
+    function(event) {
       const anchor =
         event.target &&
         event.target.closest
@@ -1686,42 +2273,27 @@ function buildBridge(
           "href"
         );
 
-      const resolved =
-        resolveTargetUrl(
+      const proxy =
+        orbitProxyTarget(
           href
         );
 
-      if (
-        resolved &&
-        isHttpUrl(
-          resolved
-        )
-      ) {
-        const proxy =
-          proxyUrlForTarget(
-            resolved
-          );
+      if (proxy) {
+        event.preventDefault();
 
-        if (proxy) {
-          event.preventDefault();
-          event.stopPropagation();
+        event.stopImmediatePropagation();
 
-          window.location.assign(
-            proxy
-          );
-        }
+        window.location.assign(
+          proxy
+        );
       }
     },
     true
   );
 
-  /* =======================================================
-     FORM SUBMIT
-  ======================================================= */
-
   document.addEventListener(
     "submit",
-    function (event) {
+    function(event) {
       const form =
         event.target;
 
@@ -1732,68 +2304,17 @@ function buildBridge(
       rewriteForm(
         form
       );
-
-      form.setAttribute(
-        "target",
-        "_self"
-      );
-
-      const action =
-        form.getAttribute(
-          "action"
-        );
-
-      if (!action) {
-        return;
-      }
-
-      const resolved =
-        resolveTargetUrl(
-          action
-        );
-
-      if (
-        resolved &&
-        isHttpUrl(
-          resolved
-        ) &&
-        !isProxyUrl(
-          resolved
-        )
-      ) {
-        const proxy =
-          proxyUrlForTarget(
-            resolved
-          );
-
-        if (proxy) {
-          form.setAttribute(
-            "action",
-            proxy
-          );
-        }
-      }
     },
     true
   );
 
-  /* =======================================================
-     MUTATION OBSERVER
-  ======================================================= */
-
-  function observeDOM() {
-    if (
-      typeof MutationObserver ===
-      "undefined"
-    ) {
-      return;
-    }
-
+  if (
+    typeof MutationObserver !==
+    "undefined"
+  ) {
     const observer =
       new MutationObserver(
-        function (
-          mutations
-        ) {
+        mutations => {
           for (
             const mutation of
               mutations
@@ -1806,11 +2327,7 @@ function buildBridge(
                 node.nodeType ===
                 1
               ) {
-                rewriteAnchors(
-                  node
-                );
-
-                rewriteForms(
+                rewriteNavigationTree(
                   node
                 );
               }
@@ -1825,150 +2342,60 @@ function buildBridge(
       observer.observe(
         document.documentElement,
         {
-          childList:
-            true,
-
-          subtree:
-            true
+          childList: true,
+          subtree: true
         }
       );
     }
   }
 
-  /* =======================================================
-     HISTORY
-  ======================================================= */
+  rewriteNavigationTree(
+    document
+  );
 
-  const nativePushState =
-    history.pushState.bind(
-      history
-    );
+  window.OrbitSource.navigate =
+    orbitNavigate;
 
-  const nativeReplaceState =
-    history.replaceState.bind(
-      history
-    );
+  window.OrbitSource.proxy =
+    orbitProxyTarget;
 
-  history.pushState =
-    function (
-      state,
-      title,
-      url
-    ) {
-      let next =
-        url == null
-          ? null
-          : resolveTargetUrl(
-              url
-            );
+  window.OrbitExtension.open =
+    orbitNavigate;
 
-      if (
-        next &&
-        isHttpUrl(
-          next
-        ) &&
-        !isProxyUrl(
-          next
-        )
-      ) {
-        const proxy =
-          proxyUrlForTarget(
-            next
-          );
+  /* =====================================================
+     AUTO EXTENSION
+  ===================================================== */
 
-        if (proxy) {
-          url =
-            proxy;
-        }
-      }
-
-      return nativePushState(
-        state,
-        title,
-        url
+  async function runExtension() {
+    const code =
+      localStorage.getItem(
+        EXTENSION_KEY
       );
-    };
 
-  history.replaceState =
-    function (
-      state,
-      title,
-      url
-    ) {
-      let next =
-        url == null
-          ? null
-          : resolveTargetUrl(
-              url
-            );
+    if (!code) {
+      return;
+    }
 
-      if (
-        next &&
-        isHttpUrl(
-          next
-        ) &&
-        !isProxyUrl(
-          next
-        )
-      ) {
-        const proxy =
-          proxyUrlForTarget(
-            next
-          );
+    try {
+      const fn =
+        new Function(
+          "window",
+          "document",
+          "location",
+          code
+        );
 
-        if (proxy) {
-          url =
-            proxy;
-        }
-      }
-
-      return nativeReplaceState(
-        state,
-        title,
-        url
+      await fn(
+        window,
+        document,
+        location
       );
-    };
-
-  /* =======================================================
-     INITIAL DOM
-  ======================================================= */
-
-  function initialize() {
-    rewriteAnchors(
-      document
-    );
-
-    rewriteForms(
-      document
-    );
-
-    observeDOM();
-
-    setTimeout(
-      function () {
-        rewriteAnchors(
-          document
-        );
-
-        rewriteForms(
-          document
-        );
-      },
-      100
-    );
-
-    setTimeout(
-      function () {
-        rewriteAnchors(
-          document
-        );
-
-        rewriteForms(
-          document
-        );
-      },
-      1000
-    );
+    } catch (error) {
+      console.error(
+        "[Orbit Extension]",
+        error
+      );
+    }
   }
 
   if (
@@ -1977,523 +2404,115 @@ function buildBridge(
   ) {
     document.addEventListener(
       "DOMContentLoaded",
-      initialize,
+      runExtension,
       {
         once: true
       }
     );
   } else {
-    initialize();
+    runExtension();
   }
 
-  /* =======================================================
-     CUSTOM INJECTION AUTO RUN
-  ======================================================= */
+  /* =====================================================
+     SPA HISTORY
+  ===================================================== */
 
-  window.__ORBIT_RUN_EXTENSION__ =
-    function (
-      code
-    ) {
-      if (
-        typeof code !==
-        "string"
-      ) {
-        return;
-      }
+  for (
+    const method of [
+      "pushState",
+      "replaceState"
+    ]
+  ) {
+    const original =
+      history[method];
 
-      try {
-        const fn =
-          new Function(
-            "OrbitSource",
-            "OrbitExtension",
-            code
+    history[method] =
+      function() {
+        const result =
+          original.apply(
+            this,
+            arguments
           );
 
-        return fn(
-          window.OrbitSource,
-          window.OrbitExtension
+        setTimeout(
+          runExtension,
+          0
         );
-      } catch (
-        error
-      ) {
-        console.error(
-          "Orbit extension error:",
-          error
-        );
-      }
-    };
+
+        return result;
+      };
+  }
+
+  window.addEventListener(
+    "popstate",
+    () => {
+      setTimeout(
+        runExtension,
+        0
+      );
+    }
+  );
 
 })();
 </script>
 `;
-}
-
-/* =========================================================
-   META REFRESH REWRITE
-========================================================= */
-
-function rewriteMetaRefresh(
-  html,
-  targetUrl,
-  sid
-) {
-  return html.replace(
-    /(<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*?\burl\s*=\s*)([^"'>]+)(["'][^>]*>)/gi,
-    function (
-      full,
-      prefix,
-      value,
-      suffix
-    ) {
-      const resolved =
-        absolute(
-          value.trim(),
-          targetUrl
-        );
-
-      if (
-        !resolved ||
-        !isHttpUrl(
-          resolved
-        )
-      ) {
-        return full;
-      }
-
-      return (
-        prefix +
-        proxyUrl(
-          resolved,
-          sid
-        ) +
-        suffix
-      );
-    }
-  );
-}
-
-/* =========================================================
-   BASE TAG REWRITE
-========================================================= */
-
-function rewriteBaseTag(
-  html,
-  targetUrl,
-  sid
-) {
-  return html.replace(
-    /<base\b([^>]*?)href\s*=\s*(["'])(.*?)\2([^>]*)>/gi,
-    function (
-      full,
-      before,
-      quote,
-      value,
-      after
-    ) {
-      const resolved =
-        absolute(
-          value,
-          targetUrl
-        );
-
-      if (
-        !resolved ||
-        !isHttpUrl(
-          resolved
-        )
-      ) {
-        return full;
-      }
-
-      return (
-        "<base" +
-        before +
-        'href="' +
-        proxyUrl(
-          resolved,
-          sid
-        ) +
-        '"' +
-        after +
-        ">"
-      );
-    }
-  );
-}
-
-/* =========================================================
-   HTML REWRITE
-========================================================= */
-
-function rewriteHTML(
-  html,
-  targetUrl,
-  sid,
-  injection
-) {
-  let output =
-    String(html);
-
-  /*
-   * Force every target attribute to _self.
-   *
-   * target="_blank"
-   * target="new"
-   * target="popup"
-   * etc.
-   *
-   * all become:
-   *
-   * target="_self"
-   */
-  output =
-    output.replace(
-      /(\s)target\s*=\s*(["'])[^"']*\2/gi,
-      '$1target="_self"'
-    );
-
-  /*
-   * Rewrite <base href>.
-   */
-  output =
-    rewriteBaseTag(
-      output,
-      targetUrl,
-      sid
-    );
-
-  /*
-   * Rewrite meta refresh.
-   */
-  output =
-    rewriteMetaRefresh(
-      output,
-      targetUrl,
-      sid
-    );
-
-  /*
-   * Rewrite URLs in HTML attributes.
-   */
-  const attributes = [
-    "href",
-    "src",
-    "action",
-    "poster",
-    "data-src",
-    "data-href",
-    "data-url",
-    "formaction"
-  ];
-
-  for (
-    const attribute of
-      attributes
-  ) {
-    const regex =
-      new RegExp(
-        "(" +
-          attribute +
-          "\\s*=\\s*[\"'])" +
-          "([^\"']+)" +
-          "([\"'])",
-        "gi"
-      );
-
-    output =
-      output.replace(
-        regex,
-        function (
-          full,
-          prefix,
-          value,
-          suffix
-        ) {
-          if (
-            shouldSkipUrl(
-              value
-            )
-          ) {
-            return full;
-          }
-
-          const resolved =
-            absolute(
-              value,
-              targetUrl
-            );
-
-          if (
-            !resolved ||
-            !isHttpUrl(
-              resolved
-            )
-          ) {
-            return full;
-          }
-
-          return (
-            prefix +
-            proxyUrl(
-              resolved,
-              sid
-            ) +
-            suffix
-          );
-        }
-      );
-  }
-
-  /*
-   * Rewrite srcset.
-   */
-  output =
-    output.replace(
-      /(srcset\s*=\s*["'])([^"']+)(["'])/gi,
-      function (
-        full,
-        prefix,
-        value,
-        suffix
-      ) {
-        const parts =
-          value.split(",");
-
-        const rewritten =
-          parts.map(
-            function (
-              part
-            ) {
-              const trimmed =
-                part.trim();
-
-              if (!trimmed) {
-                return part;
-              }
-
-              const pieces =
-                trimmed.split(
-                  /\s+/
-                );
-
-              const url =
-                pieces.shift();
-
-              if (
-                shouldSkipUrl(
-                  url
-                )
-              ) {
-                return part;
-              }
-
-              const resolved =
-                absolute(
-                  url,
-                  targetUrl
-                );
-
-              if (
-                !resolved ||
-                !isHttpUrl(
-                  resolved
-                )
-              ) {
-                return part;
-              }
-
-              return [
-                proxyUrl(
-                  resolved,
-                  sid
-                ),
-                ...pieces
-              ].join(
-                " "
-              );
-            }
-          );
-
-        return (
-          prefix +
-          rewritten.join(
-            ", "
-          ) +
-          suffix
-        );
-      }
-    );
-
-  /*
-   * Rewrite CSS url(...).
-   */
-  output =
-    output.replace(
-      /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi,
-      function (
-        full,
-        quote,
-        value
-      ) {
-        if (
-          shouldSkipUrl(
-            value
-          )
-        ) {
-          return full;
-        }
-
-        const resolved =
-          absolute(
-            value,
-            targetUrl
-          );
-
-        if (
-          !resolved ||
-          !isHttpUrl(
-            resolved
-          )
-        ) {
-          return full;
-        }
-
-        return (
-          "url(" +
-          quote +
-          proxyUrl(
-            resolved,
-            sid
-          ) +
-          quote +
-          ")"
-        );
-      }
-    );
-
-  /*
-   * Add bridge before </head>.
-   */
-  const bridge =
-    buildBridge(
-      sid,
-      targetUrl
-    );
 
   if (
-    /<\/head\s*>/i.test(
-      output
+    /<head[^>]*>/i.test(
+      html
     )
   ) {
-    output =
-      output.replace(
-        /<\/head\s*>/i,
-        bridge +
-          "</head>"
+    html =
+      html.replace(
+        /<head[^>]*>/i,
+        match =>
+          match +
+          bridge
       );
   } else {
-    output =
+    html =
       bridge +
-      output;
+      html;
   }
 
-  /*
-   * Add custom injection.
-   */
-  if (
-    typeof injection ===
-      "string" &&
-    injection.trim()
-  ) {
-    const escaped =
-      JSON.stringify(
-        injection
-      );
+  /* =====================================================
+     SERVER INJECTION COMPATIBILITY
+  ===================================================== */
 
-    const runner =
-      `<script>
-(function(){
-  try {
-    window.__ORBIT_RUN_EXTENSION__(${escaped});
-  } catch(e) {
-    console.error(
-      "Orbit injection error:",
-      e
-    );
-  }
-})();
-</script>`;
+  if (injectionId) {
+    const script = `
+<script
+  src="/inject/${encodeURIComponent(
+    injectionId
+  )}.js"
+  data-orbit-injection="server">
+</script>
+`;
 
     if (
-      /<\/body\s*>/i.test(
-        output
+      /<head[^>]*>/i.test(
+        html
       )
     ) {
-      output =
-        output.replace(
-          /<\/body\s*>/i,
-          runner +
-            "</body>"
+      html =
+        html.replace(
+          /<head[^>]*>/i,
+          match =>
+            match +
+            script
         );
     } else {
-      output +=
-        runner;
+      html =
+        script +
+        html;
     }
   }
 
-  return output;
+  return html;
 }
 
 /* =========================================================
-   REDIRECT TARGET
-========================================================= */
-
-function proxyRedirectTarget(
-  location,
-  currentTarget,
-  sid
-) {
-  if (!location) {
-    return null;
-  }
-
-  try {
-    const resolved =
-      new URL(
-        location,
-        currentTarget
-      ).href;
-
-    if (
-      !isHttpUrl(
-        resolved
-      )
-    ) {
-      return null;
-    }
-
-    /*
-     * NEVER return the upstream URL.
-     *
-     * Example:
-     *
-     * https://accounts.google.com/...
-     *
-     * becomes:
-     *
-     * /proxy/SESSION/ENCODED_URL
-     */
-    return proxyUrl(
-      resolved,
-      sid
-    );
-  } catch {
-    return null;
-  }
-}
-
-/* =========================================================
-   HANDLE PROXY
+   PROXY ENGINE
 ========================================================= */
 
 async function handleProxy(
@@ -2503,15 +2522,20 @@ async function handleProxy(
   sid
 ) {
   const session =
-    sessions.get(sid);
+    sessions.get(
+      sid
+    );
 
   if (!session) {
     return res
       .status(404)
       .send(
-        "Missing proxy session"
+        "Proxy session expired"
       );
   }
+
+  session.lastActivity =
+    Date.now();
 
   if (
     !isHttpUrl(url)
@@ -2519,7 +2543,7 @@ async function handleProxy(
     return res
       .status(400)
       .send(
-        "Invalid target URL"
+        "Only HTTP(S) URLs are supported"
       );
   }
 
@@ -2528,47 +2552,42 @@ async function handleProxy(
       req
     );
 
-  /*
-   * DAILY LIMIT ONLY.
-   *
-   * There is intentionally NO
-   * navigation cooldown here.
-   */
   if (navigation) {
     const gate =
       navigationAllowed(
         session
       );
 
-    if (
-      !gate.ok &&
-      gate.reason ===
+    if (!gate.ok) {
+      if (
+        gate.reason ===
         "daily-limit"
-    ) {
-      return res
-        .status(429)
-        .json({
-          error:
-            "Daily proxy time limit reached",
+      ) {
+        return res
+          .status(429)
+          .json({
+            error:
+              "Daily proxy time limit reached",
 
-          dailyLimitSeconds:
-            DAILY_LIMIT_MS /
-            1000,
+            dailyLimitSeconds:
+              DAILY_LIMIT_MS /
+              1000,
 
-          usedSeconds:
-            Math.ceil(
-              session.usedMs /
-                1000
-            ),
+            usedSeconds:
+              Math.ceil(
+                session.usedMs /
+                  1000
+              ),
 
-          remainingSeconds:
-            Math.floor(
-              remainingBudget(
-                session
-              ) /
-                1000
-            )
-        });
+            remainingSeconds:
+              Math.floor(
+                remainingBudget(
+                  session
+                ) /
+                  1000
+              )
+          });
+      }
     }
   }
 
@@ -2589,12 +2608,6 @@ async function handleProxy(
       url
     );
 
-    /*
-     * Count actual navigation
-     * request time.
-     *
-     * NO cooldown is applied.
-     */
     if (navigation) {
       chargeNavigation(
         session,
@@ -2608,13 +2621,26 @@ async function handleProxy(
       sid
     );
 
+    /*
+     * Ask the browser for real
+     * client/device hints.
+     *
+     * No fixed resolution.
+     */
+    res.setHeader(
+      "Accept-CH",
+      "Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-Viewport-Width, Sec-CH-Viewport-Height, DPR, Device-Memory, Save-Data, Downlink, ECT, RTT"
+    );
+
     /* =====================================================
        REDIRECT
     ===================================================== */
 
     if (
-      response.status >= 300 &&
-      response.status < 400
+      response.status >=
+        300 &&
+      response.status <
+        400
     ) {
       const location =
         response.headers.get(
@@ -2622,106 +2648,40 @@ async function handleProxy(
         );
 
       /*
-       * Every redirect stays inside
-       * the Render proxy.
+       * Never expose upstream
+       * redirect destinations.
        */
-      const proxiedLocation =
-        proxyRedirectTarget(
-          location,
-          url,
-          sid
-        );
-
-      /*
-       * Do NOT copy upstream
-       * Location/X-Frame headers.
-       */
-      for (
-        const [
-          name
-        ] of response.headers
-      ) {
-        const lower =
-          name.toLowerCase();
-
-        if (
-          lower ===
-            "location" ||
-          lower ===
-            "x-frame-options" ||
-          lower ===
-            "content-security-policy" ||
-          lower ===
-            "content-security-policy-report-only" ||
-          lower ===
-            "content-length" ||
-          lower ===
-            "content-encoding" ||
-          lower ===
-            "transfer-encoding" ||
-          lower ===
-            "set-cookie"
-        ) {
-          continue;
-        }
-
-        const value =
-          response.headers.get(
-            name
+      if (location) {
+        const next =
+          absolute(
+            location,
+            url
           );
 
         if (
-          value != null
+          next &&
+          isHttpUrl(
+            next
+          )
         ) {
           res.setHeader(
-            name,
-            value
+            "Location",
+            proxyUrl(
+              next,
+              sid
+            )
           );
         }
       }
 
-      /*
-       * IMPORTANT:
-       *
-       * Browser gets only:
-       *
-       * /proxy/session/encoded-url
-       *
-       * and NEVER:
-       *
-       * https://google.com/...
-       */
-      if (
-        proxiedLocation
-      ) {
-        res.status(
-          response.status
-        );
+      res.setHeader(
+        "Cache-Control",
+        "no-store"
+      );
 
-        res.setHeader(
-          "Location",
-          proxiedLocation
-        );
-
-        res.setHeader(
-          "Cache-Control",
-          "no-store"
-        );
-
-        return res.end();
-      }
-
-      /*
-       * Never expose a malformed
-       * upstream redirect.
-       */
       return res
         .status(
           response.status
-        )
-        .set(
-          "Cache-Control",
-          "no-store"
         )
         .end();
     }
@@ -2753,37 +2713,51 @@ async function handleProxy(
         );
 
       const html =
-        rewriteHTML(
-          data.toString(
-            "utf8"
-          ),
-          url,
-          sid,
-          session.injection
+        stripHTMLSecurityPolicies(
+          rewriteHTML(
+            data.toString(
+              "utf8"
+            ),
+            url,
+            sid
+          )
         );
 
       res.status(
         response.status
       );
 
-      /*
-       * Copy safe upstream headers.
-       *
-       * This removes:
-       *
-       * X-Frame-Options
-       * frame-ancestors
-       *
-       * from CSP.
-       */
-      copyResponseHeaders(
-        response,
-        res
-      );
-
       res.setHeader(
         "Content-Type",
         "text/html; charset=utf-8"
+      );
+
+      /*
+       * Make upstream HTML
+       * iframe-compatible.
+       */
+      res.removeHeader(
+        "X-Frame-Options"
+      );
+
+      res.removeHeader(
+        "Content-Security-Policy"
+      );
+
+      res.removeHeader(
+        "Content-Security-Policy-Report-Only"
+      );
+
+      res.removeHeader(
+        "Cross-Origin-Resource-Policy"
+      );
+
+      res.removeHeader(
+        "Cross-Origin-Embedder-Policy"
+      );
+
+      res.removeHeader(
+        "Cross-Origin-Opener-Policy"
       );
 
       res.setHeader(
@@ -2797,7 +2771,7 @@ async function handleProxy(
     }
 
     /* =====================================================
-       NON-HTML
+       EVERYTHING ELSE
     ===================================================== */
 
     res.status(
@@ -2813,26 +2787,19 @@ async function handleProxy(
       response,
       res
     );
+
   } catch (error) {
-    if (
-      !res.headersSent
-    ) {
-      return res
-        .status(502)
-        .type(
-          "text/plain"
-        )
-        .send(
-          "Proxy fetch failed: " +
-            error.message
-        );
-    }
+    console.error(
+      "Proxy error:",
+      error
+    );
 
-    try {
-      res.end();
-    } catch {}
-
-    return;
+    return res
+      .status(502)
+      .send(
+        "Proxy fetch failed: " +
+        error.message
+      );
   }
 }
 
@@ -2842,15 +2809,19 @@ async function handleProxy(
 
 app.get(
   "/open",
-  async (
-    req,
-    res
-  ) => {
+  (req, res) => {
     const target =
       req.query.url;
 
+    if (!target) {
+      return res
+        .status(400)
+        .send(
+          "Missing url"
+        );
+    }
+
     if (
-      !target ||
       !isHttpUrl(
         target
       )
@@ -2858,43 +2829,26 @@ app.get(
       return res
         .status(400)
         .send(
-          "Invalid url"
+          "Invalid HTTP(S) url"
         );
     }
 
     const sid =
       createSession(
-        target
+        target,
+        req.query.inject
       );
-
-    const session =
-      sessions.get(
-        sid
-      );
-
-    const allowed =
-      navigationAllowed(
-        session
-      );
-
-    if (!allowed.ok) {
-      return res
-        .status(429)
-        .send(
-          "Daily navigation limit reached."
-        );
-    }
 
     setSessionCookie(
       res,
       sid
     );
 
-    return handleProxy(
-      req,
-      res,
-      target,
-      sid
+    return res.redirect(
+      proxyUrl(
+        target,
+        sid
+      )
     );
   }
 );
@@ -2905,18 +2859,17 @@ app.get(
 
 app.get(
   "/session/status",
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
     const found =
       getSession(req);
 
     if (!found) {
-      return res.json({
-        active:
-          false
-      });
+      return res
+        .status(404)
+        .json({
+          error:
+            "No proxy session"
+        });
     }
 
     const session =
@@ -2927,24 +2880,20 @@ app.get(
     );
 
     return res.json({
-      active:
-        true,
-
       sid:
         found.sid,
 
       target:
         session.target,
 
-      created:
-        session.created,
+      dailyLimitSeconds:
+        DAILY_LIMIT_MS /
+        1000,
 
-      usedMs:
-        session.usedMs,
-
-      remainingMs:
-        remainingBudget(
-          session
+      usedSeconds:
+        Math.ceil(
+          session.usedMs /
+            1000
         ),
 
       remainingSeconds:
@@ -2962,7 +2911,7 @@ app.get(
 );
 
 /* =========================================================
-   PROXY BY SESSION + ENCODED URL
+   SESSION PROXY
 ========================================================= */
 
 app.all(
@@ -2975,7 +2924,6 @@ app.all(
       req.params.sid;
 
     if (
-      !sid ||
       !sessions.has(
         sid
       )
@@ -2983,14 +2931,14 @@ app.all(
       return res
         .status(404)
         .send(
-          "Missing proxy session"
+          "Proxy session expired"
         );
     }
 
-    let target;
+    let url;
 
     try {
-      target =
+      url =
         decode(
           req.params.encoded
         );
@@ -2998,33 +2946,31 @@ app.all(
       return res
         .status(400)
         .send(
-          "Invalid encoded URL"
+          "Invalid proxy URL"
         );
     }
 
     if (
-      !isHttpUrl(
-        target
-      )
+      !isHttpUrl(url)
     ) {
       return res
         .status(400)
         .send(
-          "Invalid target URL"
+          "Invalid proxy URL"
         );
     }
 
     return handleProxy(
       req,
       res,
-      target,
+      url,
       sid
     );
   }
 );
 
 /* =========================================================
-   PROXY BY URL
+   /PROXY?URL=
 ========================================================= */
 
 app.all(
@@ -3108,9 +3054,6 @@ app.all(
     let sid =
       req.query.sid;
 
-    /*
-     * Explicit sid.
-     */
     if (
       !sid ||
       !sessions.has(
@@ -3134,9 +3077,6 @@ app.all(
       }
     }
 
-    /*
-     * Referer fallback.
-     */
     if (
       !sid ||
       !sessions.has(
@@ -3189,7 +3129,7 @@ app.all(
       return res
         .status(400)
         .send(
-          "Invalid session target"
+          "Invalid target"
         );
     }
 
@@ -3205,23 +3145,12 @@ app.all(
           )
         : "";
 
-    /*
-     * IMPORTANT:
-     * /results remains a real proxy
-     * endpoint and maps to the target
-     * origin's /results.
-     */
     const target =
       new URL(
         "/results" +
           query,
         base.origin
       ).href;
-
-    setSessionCookie(
-      res,
-      sid
-    );
 
     return handleProxy(
       req,
@@ -3242,10 +3171,61 @@ app.all(
     req,
     res
   ) => {
-    const found =
-      getSession(req);
+    let sid =
+      req.query.sid;
 
-    if (!found) {
+    if (
+      !sid ||
+      !sessions.has(
+        sid
+      )
+    ) {
+      const cookieSid =
+        getCookie(
+          req,
+          "orbit_sid"
+        );
+
+      if (
+        cookieSid &&
+        sessions.has(
+          cookieSid
+        )
+      ) {
+        sid =
+          cookieSid;
+      }
+    }
+
+    if (
+      !sid ||
+      !sessions.has(
+        sid
+      )
+    ) {
+      const referer =
+        req.headers.referer ||
+        "";
+
+      const match =
+        referer.match(
+          /\/proxy\/([^/]+)\//
+        );
+
+      if (match) {
+        sid =
+          decodeURIComponent(
+            match[1]
+          );
+      }
+    }
+
+    if (
+      !sid ||
+      !sessions.has(
+        sid
+      )
+    ) {
       return res
         .status(400)
         .send(
@@ -3254,7 +3234,9 @@ app.all(
     }
 
     const session =
-      found.session;
+      sessions.get(
+        sid
+      );
 
     let base;
 
@@ -3294,13 +3276,13 @@ app.all(
       req,
       res,
       target,
-      found.sid
+      sid
     );
   }
 );
 
 /* =========================================================
-   DYNAMIC PATH
+   GENERIC DYNAMIC PATH
 ========================================================= */
 
 app.all(
@@ -3413,6 +3395,21 @@ app.all(
         );
     }
 
+    let sessionOrigin;
+
+    try {
+      sessionOrigin =
+        new URL(
+          found.session.target
+        ).origin;
+    } catch {
+      return res
+        .status(400)
+        .send(
+          "Invalid session target"
+        );
+    }
+
     let target;
 
     try {
@@ -3428,10 +3425,17 @@ app.all(
         );
     }
 
-    /*
-     * It is already a proxy request path
-     * by the time the browser navigates.
-     */
+    if (
+      target.origin !==
+      sessionOrigin
+    ) {
+      return res
+        .status(403)
+        .send(
+          "Navigation target is outside the session"
+        );
+    }
+
     return handleProxy(
       req,
       res,
@@ -3461,9 +3465,6 @@ app.all(
     const url =
       req.query.url;
 
-    /*
-     * Session-bound.
-     */
     if (
       !sid ||
       !sessions.has(
@@ -3505,10 +3506,7 @@ app.all(
 
 app.post(
   "/inject",
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
     const code =
       req.body
         ? req.body.toString(
@@ -3566,10 +3564,7 @@ app.post(
 
 app.get(
   "/inject/:id.js",
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
     const item =
       injections.get(
         req.params.id
@@ -3657,10 +3652,6 @@ app.get(
           await response.arrayBuffer()
         );
 
-      /*
-       * RAW SOURCE:
-       * no HTML rewriting.
-       */
       res.status(
         response.status
       );
@@ -3678,29 +3669,24 @@ app.get(
       return res.send(
         data
       );
-    } catch (
-      error
-    ) {
+    } catch (error) {
       return res
         .status(502)
         .send(
           "Source fetch failed: " +
-            error.message
+          error.message
         );
     }
   }
 );
 
 /* =========================================================
-   CACHE INFO
+   CACHE / SOURCE INFO
 ========================================================= */
 
 app.get(
   "/cache/info",
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
     const found =
       getSession(req);
 
@@ -3725,7 +3711,7 @@ app.get(
         found.sid,
 
       note:
-        "Resources are cached by Orbit in the browser. Missing resources fall back to the proxy."
+        "Resources are cached by Orbit in the browser. Authentication cookies remain private inside the proxy session."
     });
   }
 );
@@ -3736,10 +3722,7 @@ app.get(
 
 app.get(
   "/",
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
     return res.json({
       name:
         "Orbit Source Proxy",
@@ -3757,16 +3740,11 @@ app.get(
       navigationCooldown:
         false,
 
-      iframeEmbedding:
-        true,
-
-      upstreamFrameBlocking:
-        "removed",
-
       features: [
         "dynamic URL proxy",
         "isolated sessions",
-        "isolated target cookies",
+        "domain/path cookie jar",
+        "authentication cookie persistence",
         "HTML rewriting",
         "same-tab navigation",
         "popup blocking",
@@ -3776,13 +3754,11 @@ app.get(
         "browser resource cache",
         "browser extension storage",
         "dynamic redirects",
-        "same-origin proxy navigation",
-        "iframe compatibility",
-        "X-Frame-Options removal",
-        "CSP frame-ancestors removal",
-        "meta refresh rewriting",
-        "base href rewriting",
         "streaming resources",
+        "client hints",
+        "mobile and desktop UA forwarding",
+        "responsive viewport hints",
+        "iframe compatibility",
         "raw source",
         "results compatibility",
         "watch compatibility",
@@ -3827,9 +3803,6 @@ setInterval(
     const now =
       Date.now();
 
-    /*
-     * Remove expired sessions.
-     */
     for (
       const [
         sid,
@@ -3838,7 +3811,10 @@ setInterval(
     ) {
       if (
         now -
-          session.created >
+          (
+            session.lastActivity ||
+            session.created
+          ) >
         SESSION_TTL_MS
       ) {
         sessions.delete(
@@ -3847,9 +3823,6 @@ setInterval(
       }
     }
 
-    /*
-     * Remove expired injections.
-     */
     for (
       const [
         id,
